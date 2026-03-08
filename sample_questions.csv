@@ -1,0 +1,11 @@
+question,option_a,option_b,option_c,option_d,correct_answer,marks
+What does HTML stand for?,HyperText Markup Language,High Tech Markup Language,HyperText Machine Language,HyperTransfer Markup Language,A,2
+Which CSS property is used to change text color?,color,font-color,text-color,background-color,A,2
+What is the correct syntax for a JavaScript function?,function myFunc() {},def myFunc():,function = myFunc() {},func myFunc() {},A,2
+Which HTML tag is used for the largest heading?,<h1>,<h6>,<heading>,<head>,A,2
+What does CSS stand for?,Cascading Style Sheets,Creative Style System,Computer Style Sheets,Colorful Style Sheets,A,2
+Which operator is used for strict equality in JavaScript?,===,==,=,!==,A,2
+What is the output of typeof null in JavaScript?,object,null,undefined,string,A,2
+Which method adds an element to the end of an array in JavaScript?,push(),pop(),shift(),unshift(),A,2
+What does the 'this' keyword refer to in JavaScript?,The current object,The parent object,The global object,The DOM,A,2
+Which HTML attribute specifies the URL of a link?,href,src,link,action,A,2
