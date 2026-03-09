@@ -474,6 +474,36 @@ router.get('/tests', verifyToken, requireRole('admin'), async (req, res) => {
   }
 });
 
+// 7a. Get Full Test Details (Including Questions and Answers)
+router.get('/tests/:testId/full', verifyToken, requireRole('admin'), async (req, res) => {
+  try {
+    const { testId } = req.params;
+    
+    const testDoc = await db.collection('tests').doc(testId).get();
+    if (!testDoc.exists) return res.status(404).json({ success: false, message: 'Test not found' });
+    
+    // Fetch questions with correct answers for Admin
+    const qSnapshot = await db.collection('tests').doc(testId).collection('questions').get();
+    const questions = qSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+    // Optional: map to an array and sort by ID if they were named q1, q2...
+    questions.sort((a, b) => {
+      const numA = parseInt(a.id.replace('q', '')) || 0;
+      const numB = parseInt(b.id.replace('q', '')) || 0;
+      return numA - numB;
+    });
+
+    res.status(200).json({ 
+      success: true, 
+      test: { id: testDoc.id, ...testDoc.data() },
+      questions 
+    });
+  } catch (error) {
+    console.error('Fetch Full Test Details Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching test' });
+  }
+});
+
 // 8. Delete Test
 router.post('/tests/delete', verifyToken, requireRole('admin'), async (req, res) => {
   try {
@@ -507,6 +537,189 @@ router.post('/tests/update-status', verifyToken, requireRole('admin'), async (re
   } catch (error) {
     console.error('Update Test Status Error:', error);
     res.status(500).json({ success: false, message: 'Server error updating test status' });
+  }
+});
+
+// 10. Get Test Results (All student submissions for a test)
+router.get('/tests/:testId/results', verifyToken, requireRole('admin'), async (req, res) => {
+  try {
+    const { testId } = req.params;
+
+    const testDoc = await db.collection('tests').doc(testId).get();
+    if (!testDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Test not found' });
+    }
+    const testData = testDoc.data();
+
+    const resultsSnapshot = await db.collection('test_results').where('testId', '==', testId).get();
+    const studentIds = [...new Set(resultsSnapshot.docs.map(doc => doc.data().studentId))];
+    
+    const studentsMap = {};
+    if (studentIds.length > 0) {
+        const studentPromises = studentIds.map(uid => db.collection('users').doc(uid).get());
+        const studentDocs = await Promise.all(studentPromises);
+        studentDocs.forEach(doc => {
+            if (doc.exists) {
+                const data = doc.data();
+                studentsMap[doc.id] = {
+                    name: data.name || data.fullName || 'Unknown Student',
+                    email: data.email || 'N/A',
+                    photoURL: data.photoURL || null
+                };
+            }
+        });
+    }
+
+    const results = resultsSnapshot.docs.map(doc => {
+        const data = doc.data();
+        const student = studentsMap[data.studentId] || { name: 'Unknown Student', email: 'N/A', photoURL: null };
+        return {
+            id: doc.id,
+            studentName: student.name,
+            studentEmail: student.email,
+            studentPhoto: student.photoURL,
+            score: data.score,
+            percentage: data.percentage,
+            grade: data.grade,
+            attemptNumber: data.attemptNumber,
+            detailedReport: data.detailedReport || [],
+            submittedAt: data.submittedAt ? new Date(data.submittedAt.toDate()).toISOString() : null
+        };
+    });
+
+    results.sort((a, b) => b.percentage - a.percentage);
+
+    res.status(200).json({ success: true, testTitle: testData.title, results });
+
+  } catch (error) {
+    console.error('Fetch Test Results Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching test results' });
+  }
+});
+
+// 11. Update Test Metadata
+router.put('/tests/:testId', verifyToken, requireRole('admin'), async (req, res) => {
+  try {
+    const { testId } = req.params;
+    const updates = req.body; // { title, course, type, duration, totalMarks, etc. }
+
+    delete updates.id;
+    delete updates.questions; // Cannot be updated directly here
+    delete updates.createdAt;
+
+    updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+
+    await db.collection('tests').doc(testId).update(updates);
+
+    res.status(200).json({ success: true, message: 'Test metadata updated successfully' });
+  } catch (error) {
+    console.error('Update Test Metadata Error:', error);
+    res.status(500).json({ success: false, message: 'Server error updating test metadata' });
+  }
+});
+
+// 12. Add a Custom Question manually
+router.post('/tests/:testId/questions', verifyToken, requireRole('admin'), async (req, res) => {
+  try {
+    const { testId } = req.params;
+    const { question, options, correctAnswer, marks } = req.body;
+
+    if (!question || !options || !correctAnswer || !marks) {
+      return res.status(400).json({ success: false, message: 'Missing required question fields' });
+    }
+
+    const testRef = db.collection('tests').doc(testId);
+    const testDoc = await testRef.get();
+    
+    if (!testDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Test not found' });
+    }
+
+    // Generate numeric id like q41
+    const currentQuestionsCount = testDoc.data().questions || 0;
+    const newCount = currentQuestionsCount + 1;
+    const newQId = `q${Date.now()}`; // Unique enough or use q<number> but careful of deletions
+
+    const questionData = {
+      question,
+      options,
+      correctAnswer: String(correctAnswer).toUpperCase(),
+      marks: Number(marks)
+    };
+
+    await db.collection('tests').doc(testId).collection('questions').doc(newQId).set(questionData);
+    
+    // Increment count on test doc
+    await testRef.update({ questions: newCount });
+
+    res.status(201).json({ success: true, message: 'Question added successfully', question: { id: newQId, ...questionData } });
+
+  } catch (error) {
+    console.error('Add Question Error:', error);
+    res.status(500).json({ success: false, message: 'Server error adding question' });
+  }
+});
+
+// 13. Update a Custom Question
+router.put('/tests/:testId/questions/:questionId', verifyToken, requireRole('admin'), async (req, res) => {
+  try {
+    const { testId, questionId } = req.params;
+    const { question, options, correctAnswer, marks } = req.body;
+
+    if (!question || !options || !correctAnswer || !marks) {
+      return res.status(400).json({ success: false, message: 'Missing required question fields' });
+    }
+
+    const qRef = db.collection('tests').doc(testId).collection('questions').doc(questionId);
+    const qDoc = await qRef.get();
+    
+    if (!qDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Question not found' });
+    }
+
+    const questionData = {
+      question,
+      options,
+      correctAnswer: String(correctAnswer).toUpperCase(),
+      marks: Number(marks)
+    };
+
+    await qRef.update(questionData);
+
+    res.status(200).json({ success: true, message: 'Question updated successfully', question: { id: questionId, ...questionData } });
+
+  } catch (error) {
+    console.error('Update Question Error:', error);
+    res.status(500).json({ success: false, message: 'Server error updating question' });
+  }
+});
+
+// 14. Delete a Custom Question
+router.delete('/tests/:testId/questions/:questionId', verifyToken, requireRole('admin'), async (req, res) => {
+  try {
+    const { testId, questionId } = req.params;
+
+    const testRef = db.collection('tests').doc(testId);
+    const testDoc = await testRef.get();
+    
+    if (!testDoc.exists) return res.status(404).json({ success: false, message: 'Test not found' });
+
+    const qRef = db.collection('tests').doc(testId).collection('questions').doc(questionId);
+    const qDoc = await qRef.get();
+    if (!qDoc.exists) return res.status(404).json({ success: false, message: 'Question not found' });
+
+    await qRef.delete();
+    
+    // Decrement count
+    const currentCount = testDoc.data().questions || 0;
+    const newCount = Math.max(0, currentCount - 1);
+    await testRef.update({ questions: newCount });
+
+    res.status(200).json({ success: true, message: 'Question deleted successfully', newOptionsCount: newCount });
+
+  } catch (error) {
+    console.error('Delete Question Error:', error);
+    res.status(500).json({ success: false, message: 'Server error deleting question' });
   }
 });
 
