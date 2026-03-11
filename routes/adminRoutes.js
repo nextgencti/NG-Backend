@@ -4,6 +4,7 @@ const verifyToken = require('../middleware/authMiddleware');
 const requireRole = require('../middleware/roleMiddleware');
 const upload = require('../middleware/uploadMiddleware');
 const cloudinary = require('../config/cloudinary');
+const emailService = require('../utils/emailService');
 const router = express.Router();
 
 // Utility for uploading memory buffer to cloudinary
@@ -92,6 +93,37 @@ router.put('/students/:id/status', verifyToken, requireRole('admin'), async (req
       status: status,
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
+
+    // Assign Roll Number if approving for the first time
+    if (status === 'active' && !studentDoc.data().rollNumber) {
+      await db.runTransaction(async (transaction) => {
+        const counterRef = db.collection('counters').doc('students');
+        const counterDoc = await transaction.get(counterRef);
+        
+        let nextCount = 1;
+        if (!counterDoc.exists) {
+          transaction.set(counterRef, { count: 1 });
+        } else {
+          nextCount = counterDoc.data().count + 1;
+          transaction.update(counterRef, { count: nextCount });
+        }
+
+        const year = new Date().getFullYear();
+        const rollNumber = `NG-${year}-${String(nextCount).padStart(3, '0')}`;
+        transaction.update(studentRef, { rollNumber });
+      });
+    }
+
+    // Send approval email if status is active
+    if (status === 'active') {
+      try {
+        const studentData = studentDoc.data();
+        await emailService.sendApprovalEmail(studentData.email, studentData.name || studentData.fullName);
+      } catch (emailError) {
+        console.error('Failed to send approval email:', emailError);
+        // We don't fail the request if email fails, but we log it
+      }
+    }
 
     res.status(200).json({ success: true, message: `Student status updated to ${status}` });
   } catch (error) {
@@ -251,7 +283,7 @@ router.post('/courses', verifyToken, requireRole('admin'), upload.single('thumbn
 // 5. Add New Student
 router.post('/students', verifyToken, requireRole('admin'), upload.single('profilePic'), async (req, res) => {
   try {
-    const { name, email, courseId, phone } = req.body;
+    const { name, email, courseId, phone, address } = req.body;
     let photoURL = null;
 
     if (!name || !email) {
@@ -282,6 +314,24 @@ router.post('/students', verifyToken, requireRole('admin'), upload.single('profi
     const { uid } = userRecord;
 
     // 2. Save in Firestore
+    // 3. Assign Roll Number
+    let rollNumber = null;
+    await db.runTransaction(async (transaction) => {
+      const counterRef = db.collection('counters').doc('students');
+      const counterDoc = await transaction.get(counterRef);
+      
+      let nextCount = 1;
+      if (!counterDoc.exists) {
+        transaction.set(counterRef, { count: 1 });
+      } else {
+        nextCount = counterDoc.data().count + 1;
+        transaction.update(counterRef, { count: nextCount });
+      }
+
+      const year = new Date().getFullYear();
+      rollNumber = `NG-${year}-${String(nextCount).padStart(3, '0')}`;
+    });
+
     const userData = {
       uid,
       email,
@@ -289,10 +339,12 @@ router.post('/students', verifyToken, requireRole('admin'), upload.single('profi
       fullName: name,
       courseId: courseId || null,
       phone: phone || null,
+      address: address || null,
       role: 'student',
       profileComplete: true, // Mark as complete since Admin created it
       photoURL,
       status: 'active',
+      rollNumber,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     };
 

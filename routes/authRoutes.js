@@ -2,6 +2,7 @@ const express = require('express');
 const { admin, db, auth } = require('../config/firebase');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
+const emailService = require('../utils/emailService');
 const router = express.Router();
 
 // Mock store for OTPs (In production, use Redis)
@@ -20,32 +21,32 @@ router.post('/send-otp', async (req, res) => {
     return res.status(400).json({ success: false, message: 'Email is required' });
   }
 
+  // Rate limiting: Check if an OTP was sent in the last 5 minutes
+  const existingRecord = otpStore.get(email);
+  if (existingRecord && Date.now() < existingRecord.canResendAt) {
+    const waitTime = Math.ceil((existingRecord.canResendAt - Date.now()) / 1000 / 60);
+    return res.status(429).json({ 
+      success: false, 
+      message: `Please wait ${waitTime} minute(s) before requesting a new OTP.` 
+    });
+  }
+
   // Generate a mock or real 6 digit OTP (using static for demo or random)
   const otp = Math.floor(100000 + Math.random() * 900000).toString(); 
   
   // Store it 
   otpStore.set(email, {
     otp,
-    expires: Date.now() + 10 * 60 * 1000 // 10 minutes
+    expires: Date.now() + 5 * 60 * 1000, // 5 minutes validity
+    canResendAt: Date.now() + 5 * 60 * 1000 // 5 minutes rate limit
   });
 
-  // Mail Send via Google Apps Script (GAS)
+  // Mail Send via centralized Email Service
   try {
-    const gasUrl = process.env.GAS_URL;
-    if (gasUrl && gasUrl !== "your_google_apps_script_web_app_url_here") {
-      // Depending on how your GAS is setup, we send JSON body
-      await axios.post(gasUrl, { 
-        action: 'SEND_OTP',
-        email, 
-        otp, 
-        subject: 'NextGen Student OTP' 
-      });
-      console.log(`Sent real OTP via GAS to ${email}`);
-    } else {
-      console.log(`[DEV_MODE] GAS_URL not set. Mocking OTP: ${otp} for ${email}`);
-    }
+    await emailService.sendOTPEmail(email, otp);
+    console.log(`Email service triggered for OTP: ${otp} to ${email}`);
   } catch (error) {
-    console.error('Failed to send email via GAS:', error.message);
+    console.error('Failed to send email via service:', error.message);
     // Proceeding anyway so dev doesn't break if script fails
   }
 
