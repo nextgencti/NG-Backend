@@ -9,8 +9,8 @@ const router = express.Router();
 const otpStore = new Map();
 
 // Generate Token helper
-const generateToken = (uid, role) => {
-  return jwt.sign({ uid, role }, process.env.JWT_SECRET || 'secret', { expiresIn: '7d' });
+const generateToken = (uid, role, instituteId = null) => {
+  return jwt.sign({ uid, role, instituteId }, process.env.JWT_SECRET || 'secret', { expiresIn: '7d' });
 };
 
 // 1. Send OTP
@@ -116,8 +116,21 @@ router.post('/verify-otp', async (req, res) => {
       userData = userDoc.data();
     }
 
+    // Fetch Institute Name if instituteId exists
+    if (userData.instituteId) {
+      try {
+        const instDoc = await db.collection('institutes').doc(userData.instituteId).get();
+        if (instDoc.exists) {
+          userData.instituteName = instDoc.data().name;
+          userData.instituteLogoURL = instDoc.data().logoURL;
+        }
+      } catch (err) {
+        console.warn('Failed to fetch institute name:', err.message);
+      }
+    }
+
     // 5. Generate JWT
-    const token = generateToken(uid, userData.role);
+    const token = generateToken(uid, userData.role, userData.instituteId);
 
     return res.status(200).json({
       success: true,
@@ -175,8 +188,20 @@ router.post('/google-login', async (req, res) => {
       }
     }
 
+    // Fetch Institute Name if instituteId exists
+    if (userData.instituteId) {
+      try {
+        const instDoc = await db.collection('institutes').doc(userData.instituteId).get();
+        if (instDoc.exists) {
+          userData.instituteName = instDoc.data().name;
+        }
+      } catch (err) {
+        console.warn('Failed to fetch institute name:', err.message);
+      }
+    }
+
     // Generate session JWT
-    const token = generateToken(uid, userData.role);
+    const token = generateToken(uid, userData.role, userData.instituteId);
 
     return res.status(200).json({
       success: true,
@@ -192,4 +217,42 @@ router.post('/google-login', async (req, res) => {
   }
 });
 
+// 4. Register Institute Request
+router.post('/register-institute', async (req, res) => {
+  try {
+    const { instituteName, address, phone, email, adminName } = req.body;
+
+    if (!instituteName || !email || !adminName) {
+      return res.status(400).json({ success: false, message: 'Missing required fields' });
+    }
+
+    // Check if institute name or email already exists in requests or active
+    const existingReq = await db.collection('institute_requests').where('email', '==', email).get();
+    if (!existingReq.empty) {
+      return res.status(400).json({ success: false, message: 'A request with this email already exists' });
+    }
+
+    const requestData = {
+      instituteName,
+      address: address || '',
+      phone: phone || '',
+      email,
+      adminName,
+      status: 'pending',
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    await db.collection('institute_requests').add(requestData);
+
+    res.status(201).json({ 
+      success: true, 
+      message: 'Registration request submitted successfully. Super Admin will verify it soon.' 
+    });
+  } catch (error) {
+    console.error('Register Institute Error:', error);
+    res.status(500).json({ success: false, message: 'Server error submitting request' });
+  }
+});
+
 module.exports = router;
+

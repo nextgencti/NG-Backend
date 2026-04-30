@@ -18,12 +18,20 @@ app.get('/', (req, res) => {
 const authRoutes = require('./routes/authRoutes');
 const studentRoutes = require('./routes/studentRoutes');
 const adminRoutes = require('./routes/adminRoutes');
+const superAdminRoutes = require('./routes/superAdminRoutes');
 const configRoutes = require('./routes/configRoutes');
 
 app.use('/api/auth', authRoutes);
 app.use('/api/student', studentRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/superadmin', superAdminRoutes);
 app.use('/api/config', configRoutes);
+
+// Global error handler - catches errors from any route
+app.use((err, req, res, next) => {
+  console.error('GLOBAL ERROR HANDLER caught:', JSON.stringify(err, Object.getOwnPropertyNames(err)));
+  res.status(500).json({ success: false, message: 'Global error: ' + (err.message || JSON.stringify(err)) });
+});
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);

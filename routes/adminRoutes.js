@@ -8,10 +8,16 @@ const emailService = require('../utils/emailService');
 const router = express.Router();
 
 // Utility for uploading memory buffer to cloudinary
-const uploadToCloudinary = (fileBuffer, folder) => {
+const uploadToCloudinary = (fileBuffer, folder, mimetype = '') => {
   return new Promise((resolve, reject) => {
+    // Determine the correct resource type. Cloudinary often blocks PDFs uploaded as 'image' (401 Unauthorized)
+    const resourceType = mimetype === 'application/pdf' ? 'raw' : 'auto';
+    
     const uploadStream = cloudinary.uploader.upload_stream(
-      { folder: folder },
+      { 
+        folder: folder,
+        resource_type: resourceType
+      },
       (error, result) => {
         if (error) reject(error);
         else resolve(result);
@@ -25,10 +31,18 @@ const uploadToCloudinary = (fileBuffer, folder) => {
 router.get('/stats', verifyToken, requireRole('admin'), async (req, res) => {
   // ... (unchanged)
   try {
-    const studentsSnapshot = await db.collection('users').where('role', '==', 'student').get();
+    let studentsQuery = db.collection('users').where('role', '==', 'student');
+    if (req.user.role === 'admin' && req.user.instituteId) {
+      studentsQuery = studentsQuery.where('instituteId', '==', req.user.instituteId);
+    }
+    const studentsSnapshot = await studentsQuery.get();
     const studentsCount = studentsSnapshot.size;
 
-    const coursesSnapshot = await db.collection('courses').get();
+    let coursesQuery = db.collection('courses');
+    if (req.user.role === 'admin' && req.user.instituteId) {
+      coursesQuery = coursesQuery.where('instituteId', '==', req.user.instituteId);
+    }
+    const coursesSnapshot = await coursesQuery.get();
     const coursesCount = coursesSnapshot.size;
 
     const stats = {
@@ -48,7 +62,11 @@ router.get('/stats', verifyToken, requireRole('admin'), async (req, res) => {
 router.get('/students', verifyToken, requireRole('admin'), async (req, res) => {
   // ... (unchanged)
   try {
-    const studentsSnapshot = await db.collection('users').where('role', '==', 'student').get();
+    let studentsQuery = db.collection('users').where('role', '==', 'student');
+    if (req.user.role === 'admin' && req.user.instituteId) {
+      studentsQuery = studentsQuery.where('instituteId', '==', req.user.instituteId);
+    }
+    const studentsSnapshot = await studentsQuery.get();
     
     let studentsData = [];
     studentsSnapshot.forEach(doc => {
@@ -132,11 +150,72 @@ router.put('/students/:id/status', verifyToken, requireRole('admin'), async (req
   }
 });
 
+// 2b. Delete a Student
+router.delete('/students/:id', verifyToken, requireRole(['superadmin', 'admin']), async (req, res) => {
+  const { id } = req.params;
+  const { pin } = req.body;
+
+  if (!pin) {
+    return res.status(400).json({ success: false, message: 'PIN is required to delete a student' });
+  }
+
+  try {
+    // Determine which PIN to check based on context / user role
+    const correctSuperAdminPin = process.env.SUPERADMIN_PIN;
+    const correctAdminPin = process.env.ADMIN_PIN;
+    
+    // We allow either PIN if they are a superadmin. Just admin pin if they are an admin.
+    let isValidPin = false;
+    if (req.user.role === 'superadmin' && String(pin) === String(correctSuperAdminPin)) {
+      isValidPin = true;
+    } else if (String(pin) === String(correctAdminPin)) {
+      isValidPin = true;
+    }
+
+    if (!isValidPin) {
+      return res.status(403).json({ success: false, message: 'Invalid PIN provided' });
+    }
+
+    const studentRef = db.collection('users').doc(id);
+    const studentDoc = await studentRef.get();
+
+    if (!studentDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Student not found' });
+    }
+
+    // Optional: Delete from Firebase Auth if desired
+    try {
+      await auth.deleteUser(id);
+    } catch (authErr) {
+      console.log(`Auth deletion skipped or failed for ${id}:`, authErr.message);
+    }
+
+    // Delete related enrollments (if you want to clean up)
+    const enrollmentsSnapshot = await db.collection('enrollments').where('studentId', '==', id).get();
+    const batch = db.batch();
+    enrollmentsSnapshot.docs.forEach((doc) => {
+      batch.delete(doc.ref);
+    });
+    
+    batch.delete(studentRef);
+    await batch.commit();
+
+    res.status(200).json({ success: true, message: 'Student deleted successfully' });
+  } catch (error) {
+    console.error('Delete Student Error:', error);
+    res.status(500).json({ success: false, message: 'Server error deleting student' });
+  }
+});
+
 // 3. Get All Courses
 router.get('/courses', verifyToken, requireRole('admin'), async (req, res) => {
   // ... (unchanged)
   try {
-    const coursesSnapshot = await db.collection('courses').get();
+    let coursesQuery = db.collection('courses');
+    if (req.user.role === 'admin' && req.user.instituteId) {
+      coursesQuery = coursesQuery.where('instituteId', '==', req.user.instituteId);
+    }
+    const coursesSnapshot = await coursesQuery.get();
     let coursesData = [];
     
     coursesSnapshot.forEach(doc => {
@@ -160,9 +239,11 @@ router.get('/courses', verifyToken, requireRole('admin'), async (req, res) => {
 // 3a. Get Pending Enrollments
 router.get('/enrollments/pending', verifyToken, requireRole('admin'), async (req, res) => {
   try {
-    const enrollmentsSnapshot = await db.collection('enrollments')
-      .where('status', '==', 'pending')
-      .get();
+    let enrollmentsQuery = db.collection('enrollments').where('status', '==', 'pending');
+    if (req.user.role === 'admin' && req.user.instituteId) {
+      enrollmentsQuery = enrollmentsQuery.where('instituteId', '==', req.user.instituteId);
+    }
+    const enrollmentsSnapshot = await enrollmentsQuery.get();
       
     if (enrollmentsSnapshot.empty) {
       return res.status(200).json({ success: true, pendingRequests: [] });
@@ -266,6 +347,10 @@ router.post('/courses', verifyToken, requireRole('admin'), upload.single('thumbn
       createdAt: new Date()
     };
 
+    if (req.user.role === 'admin' && req.user.instituteId) {
+      courseData.instituteId = req.user.instituteId;
+    }
+
     const docRef = await db.collection('courses').add(courseData);
 
     res.status(201).json({ 
@@ -277,6 +362,60 @@ router.post('/courses', verifyToken, requireRole('admin'), upload.single('thumbn
   } catch (error) {
     console.error('Create Course Error:', error);
     res.status(500).json({ success: false, message: 'Server error creating course' });
+  }
+});
+
+// 4b. Update Course Curriculum (Saves modules array)
+router.put('/courses/:id/curriculum', verifyToken, requireRole('admin'), async (req, res) => {
+  const { id } = req.params;
+  const { curriculum } = req.body; // Expects the modules array
+
+  try {
+    const courseRef = db.collection('courses').doc(id);
+    const courseDoc = await courseRef.get();
+
+    if (!courseDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Course not found' });
+    }
+
+    await courseRef.update({
+      curriculum: curriculum,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.status(200).json({ success: true, message: 'Curriculum updated successfully' });
+  } catch (error) {
+    console.error('Update Curriculum Error:', error);
+    res.status(500).json({ success: false, message: 'Server error updating curriculum' });
+  }
+});
+
+// 4c. Upload Content Image (for Jodit Editor / Cloudinary)
+router.post('/upload-content-image', verifyToken, requireRole('admin'), upload.any(), async (req, res) => {
+  try {
+    if (!req.files || req.files.length === 0) {
+      console.error('[Upload] No files found in request');
+      return res.status(400).json({ success: false, message: 'No image files provided' });
+    }
+
+    // Capture the first file regardless of field name (handles files[0], files[1], etc.)
+    const file = req.files[0];
+    console.log(`[Upload] Processing file: ${file.originalname} (Field: ${file.fieldname}, MimeType: ${file.mimetype})`);
+
+    const result = await uploadToCloudinary(file.buffer, 'course_content_assets', file.mimetype);
+    console.log('[Upload] Cloudinary Success:', result.secure_url);
+    
+    res.status(200).json({ 
+      success: true, 
+      url: result.secure_url 
+    });
+  } catch (error) {
+    console.error('Content Image Upload Error Detail:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to upload image', 
+      error: error.message 
+    });
   }
 });
 
@@ -348,16 +487,24 @@ router.post('/students', verifyToken, requireRole('admin'), upload.single('profi
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     };
 
+    if (req.user.role === 'admin' && req.user.instituteId) {
+      userData.instituteId = req.user.instituteId;
+    }
+
     await db.collection('users').doc(uid).set(userData, { merge: true });
 
     // 3. Create initial enrollment record if courseId is provided
     if (courseId) {
-      await db.collection('enrollments').add({
+      const enrollmentData = {
         studentId: uid,
         courseId: courseId,
         enrolledAt: admin.firestore.FieldValue.serverTimestamp(),
         status: 'active'
-      });
+      };
+      if (req.user.role === 'admin' && req.user.instituteId) {
+        enrollmentData.instituteId = req.user.instituteId;
+      }
+      await db.collection('enrollments').add(enrollmentData);
       
       // Update student count in course
       const courseRef = db.collection('courses').doc(courseId);
@@ -478,6 +625,10 @@ router.post('/tests', verifyToken, requireRole('admin'), csvUpload.single('quest
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
+    if (req.user.role === 'admin' && req.user.instituteId) {
+      testData.instituteId = req.user.instituteId;
+    }
+
     // Save the test document
     const testRef = await db.collection('tests').add(testData);
     const testId = testRef.id;
@@ -516,13 +667,30 @@ router.post('/tests', verifyToken, requireRole('admin'), csvUpload.single('quest
 });
 
 // 7. Get All Tests
+// 7. Get All Tests
 router.get('/tests', verifyToken, requireRole('admin'), async (req, res) => {
   try {
-    const snapshot = await db.collection('tests').orderBy('createdAt', 'desc').get();
+    console.log('DEBUG: /tests route hit, user role:', req.user?.role, 'instituteId:', req.user?.instituteId);
+
+    let testsQuery = db.collection('tests');
+    if (req.user.role === 'admin' && req.user.instituteId) {
+      testsQuery = testsQuery.where('instituteId', '==', req.user.instituteId);
+    }
+    const snapshot = await testsQuery.get();
+    console.log('DEBUG: Got snapshot, size:', snapshot.size);
     const tests = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+    // Sort in JS instead of Firestore to avoid needing a composite index
+    tests.sort((a, b) => {
+      const dateA = a.createdAt?.toDate ? a.createdAt.toDate() : (a.createdAt || 0);
+      const dateB = b.createdAt?.toDate ? b.createdAt.toDate() : (b.createdAt || 0);
+      return new Date(dateB) - new Date(dateA);
+    });
+
     res.status(200).json({ success: true, tests });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Server error fetching tests' });
+    console.error('Fetch Tests Error FULL:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
+    res.status(500).json({ success: false, message: 'Server error fetching tests: ' + (error.message || error.code || JSON.stringify(error)) });
   }
 });
 
@@ -775,5 +943,108 @@ router.delete('/tests/:testId/questions/:questionId', verifyToken, requireRole('
   }
 });
 
+// 15. Verify Admin PIN
+router.post('/verify-pin', verifyToken, requireRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const { pin } = req.body;
+    const ADMIN_SECRET_PIN = process.env.ADMIN_PIN || '1234';
+    
+    // Note: If a superadmin is accessing an admin route, they might use the Admin PIN or it could be bypassed 
+    // but typically they wouldn't hit this endpoint since they login via SA PIN. Just in case, this is here.
+    if (String(pin) === String(ADMIN_SECRET_PIN)) {
+      return res.status(200).json({ success: true, message: 'PIN Verified' });
+    }
+    
+    return res.status(401).json({ success: false, message: 'Invalid Admin PIN' });
+  } catch (error) {
+    console.error('Verify Admin PIN Error:', error);
+    res.status(500).json({ success: false, message: 'Server error verifying PIN' });
+  }
+});
+
+// 16. Profile & Institute Management
+router.get('/profile', verifyToken, requireRole('admin'), async (req, res) => {
+  try {
+    const userDoc = await db.collection('users').doc(req.user.uid).get();
+    if (!userDoc.exists) return res.status(404).json({ success: false, message: 'User not found' });
+    res.status(200).json({ success: true, profile: userDoc.data() });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Server error fetching profile' });
+  }
+});
+
+router.put('/profile', verifyToken, requireRole('admin'), upload.single('photo'), async (req, res) => {
+  try {
+    const { name, phone } = req.body;
+    let { photoURL } = req.body;
+    const updates = {};
+    
+    if (name) updates.name = updates.fullName = name;
+    if (phone) updates.phone = phone;
+    
+    if (req.file) {
+      const result = await uploadToCloudinary(req.file.buffer, 'admin_profiles');
+      photoURL = result.secure_url;
+    }
+    
+    if (photoURL) updates.photoURL = photoURL;
+    
+    updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+    await db.collection('users').doc(req.user.uid).update(updates);
+    
+    // Fetch updated user to return
+    const updatedUser = (await db.collection('users').doc(req.user.uid).get()).data();
+    
+    res.status(200).json({ success: true, message: 'Profile updated successfully', user: updatedUser });
+  } catch (error) {
+    console.error('Update Profile Error:', error);
+    res.status(500).json({ success: false, message: 'Server error updating profile' });
+  }
+});
+
+router.get('/institute', verifyToken, requireRole('admin'), async (req, res) => {
+  try {
+    if (!req.user.instituteId) return res.status(400).json({ success: false, message: 'No institute associated with this account' });
+    const instDoc = await db.collection('institutes').doc(req.user.instituteId).get();
+    if (!instDoc.exists) return res.status(404).json({ success: false, message: 'Institute not found' });
+    res.status(200).json({ success: true, institute: instDoc.data() });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Server error fetching institute details' });
+  }
+});
+
+router.put('/institute', verifyToken, requireRole('admin'), upload.single('logo'), async (req, res) => {
+  try {
+    if (!req.user.instituteId) return res.status(400).json({ success: false, message: 'No institute associated with this account' });
+    const { name, address, phone, email } = req.body;
+    let { logoURL } = req.body;
+    const updates = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+    
+    if (name) updates.name = name;
+    if (address) updates.address = address;
+    if (phone) updates.phone = phone;
+    if (email) updates.email = email;
+
+    if (req.file) {
+      const result = await uploadToCloudinary(req.file.buffer, 'institute_logos');
+      logoURL = result.secure_url;
+    }
+    
+    if (logoURL) updates.logoURL = logoURL;
+    
+    await db.collection('institutes').doc(req.user.instituteId).update(updates);
+    
+    // Fetch updated institute
+    const updatedInst = (await db.collection('institutes').doc(req.user.instituteId).get()).data();
+    
+    res.status(200).json({ success: true, message: 'Institute details updated successfully', institute: updatedInst });
+  } catch (error) {
+    console.error('Update Institute Error:', error);
+    res.status(500).json({ success: false, message: 'Server error updating institute' });
+  }
+});
+
+
 module.exports = router;
+
 

@@ -3,6 +3,9 @@ const otpTemplate = require('../emails/otp');
 const welcomeTemplate = require('../emails/welcome');
 const resetPasswordTemplate = require('../emails/resetPassword');
 const approvalTemplate = require('../emails/approval');
+const rejectionTemplate = require('../emails/rejection');
+const instituteApprovalTemplate = require('../emails/instituteApproval');
+
 
 /**
  * Centralized Email Service.
@@ -59,7 +62,35 @@ const emailService = {
       subject: 'Account Approved - NextGen Computer Training Institute Muskara',
       html
     });
+  },
+
+  /**
+   * Send Institute Approval Email
+   */
+  sendInstituteApprovalEmail: async (email, name, instituteName, tempPin) => {
+    const provider = providerManager.getProvider();
+    const html = instituteApprovalTemplate(name, instituteName, tempPin);
+    return provider.send({
+      to: email,
+      subject: `Registration Approved - ${instituteName}`,
+      html
+    });
+  },
+
+
+  /**
+   * Send Institute Rejection Email
+   */
+  sendInstituteRejectionEmail: async (email, name, instituteName, reason) => {
+    const provider = providerManager.getProvider();
+    const html = rejectionTemplate(name, instituteName, reason);
+    return provider.send({
+      to: email,
+      subject: `Registration Update - ${instituteName}`,
+      html
+    });
   }
 };
+
 
 module.exports = emailService;

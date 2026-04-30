@@ -46,10 +46,10 @@ router.post('/upload-photo', verifyToken, upload.single('photo'), async (req, re
 // 1. Complete Profile (Protected)
 router.post('/complete-profile', verifyToken, async (req, res) => {
   const { uid } = req.user; // from JWT middleware
-  const { address, phone, dob, photoURL, name, courseId, password } = req.body;
+  const { address, phone, dob, photoURL, name, courseId, instituteId, password } = req.body;
 
-  if (!phone || !name || !courseId) {
-    return res.status(400).json({ success: false, message: 'Name, Course, and Phone are required' });
+  if (!phone || !name || !courseId || !instituteId) {
+    return res.status(400).json({ success: false, message: 'Name, Course, Institute, and Phone are required' });
   }
 
   try {
@@ -69,6 +69,7 @@ router.post('/complete-profile', verifyToken, async (req, res) => {
     await userRef.update({
       name: name,
       courseId: courseId,
+      instituteId: instituteId,
       address: address || '',
       phone: phone,
       dob: dob || '2000-01-01',
@@ -79,11 +80,24 @@ router.post('/complete-profile', verifyToken, async (req, res) => {
 
     // Return the updated user info
     const updatedDoc = await userRef.get();
+    const updatedData = updatedDoc.data();
+
+    // Fetch Institute Name
+    if (updatedData.instituteId) {
+      try {
+        const instDoc = await db.collection('institutes').doc(updatedData.instituteId).get();
+        if (instDoc.exists) {
+          updatedData.instituteName = instDoc.data().name;
+        }
+      } catch (err) {
+        console.warn('Failed to fetch institute name:', err.message);
+      }
+    }
 
     res.status(200).json({ 
       success: true, 
       message: 'Profile completed successfully',
-      user: updatedDoc.data()
+      user: updatedData
     });
 
   } catch (error) {
@@ -138,11 +152,24 @@ router.put('/update-profile', verifyToken, async (req, res) => {
     }
 
     const updatedDoc = await userRef.get();
+    const updatedData = updatedDoc.data();
+
+    // Fetch Institute Name
+    if (updatedData.instituteId) {
+      try {
+        const instDoc = await db.collection('institutes').doc(updatedData.instituteId).get();
+        if (instDoc.exists) {
+          updatedData.instituteName = instDoc.data().name;
+        }
+      } catch (err) {
+        console.warn('Failed to fetch institute name:', err.message);
+      }
+    }
 
     res.status(200).json({
       success: true,
       message: 'Profile updated successfully',
-      user: updatedDoc.data()
+      user: updatedData
     });
   } catch (error) {
     console.error('Update Profile Error:', error);
@@ -312,12 +339,36 @@ router.post('/tests/:testId/submit', verifyToken, async (req, res) => {
 
 // 8. Get All Available Courses (For Catalog)
 router.get('/all-courses', verifyToken, async (req, res) => {
+  const { uid } = req.user;
   try {
-    const snapshot = await db.collection('courses').where('status', '==', 'active').get();
+    // Fetch student's instituteId
+    const userDoc = await db.collection('users').doc(uid).get();
+    const studentInstId = userDoc.data()?.instituteId;
+
+    let query = db.collection('courses').where('status', '==', 'active');
+    
+    if (studentInstId) {
+      query = query.where('instituteId', '==', studentInstId);
+    }
+
+    const snapshot = await query.get();
     const courses = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
     res.status(200).json({ success: true, courses });
   } catch (error) {
+    console.error('Fetch Catalog Error:', error);
     res.status(500).json({ success: false, message: 'Server error fetching catalog' });
+  }
+});
+
+// 9. Get All Available Institutes (For Signup Profile Completion)
+router.get('/all-institutes', verifyToken, async (req, res) => {
+  try {
+    const snapshot = await db.collection('institutes').where('status', '==', 'active').get();
+    const institutes = snapshot.docs.map(doc => ({ id: doc.id, name: doc.data().name }));
+    res.status(200).json({ success: true, institutes });
+  } catch (error) {
+    console.error('Fetch Institutes Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching institutes' });
   }
 });
 
@@ -339,10 +390,15 @@ router.post('/enroll', verifyToken, async (req, res) => {
       return res.status(400).json({ success: false, message: 'You are already enrolled in this course' });
     }
 
+    // Fetch student's instituteId to link enrollment to tenant
+    const userDoc = await db.collection('users').doc(uid).get();
+    const studentInstId = userDoc.data()?.instituteId;
+
     // Create enrollment record
     const enrollmentData = {
       studentId: uid,
       courseId,
+      instituteId: studentInstId || null,
       enrolledAt: new Date(),
       status: 'pending' // New enrollments require admin approval
     };
@@ -434,9 +490,17 @@ router.get('/tests', verifyToken, async (req, res) => {
 
     let allTests = [];
     for (const chunk of chunks) {
-      const snapshot = await db.collection('tests')
-        .where('course', 'in', chunk)
-        .get();
+      let query = db.collection('tests').where('course', 'in', chunk);
+      
+      // Filter by instituteId if available on the student
+      const userDoc = await db.collection('users').doc(uid).get();
+      const studentInstId = userDoc.data()?.instituteId;
+      
+      if (studentInstId) {
+        query = query.where('instituteId', '==', studentInstId);
+      }
+        
+      const snapshot = await query.get();
         
       const testsArr = snapshot.docs.map(doc => ({
         id: doc.id,
@@ -485,6 +549,187 @@ router.get('/tests', verifyToken, async (req, res) => {
   } catch (error) {
     console.error('Fetch Student Tests Error:', error);
     res.status(500).json({ success: false, message: 'Server error fetching tests' });
+  }
+});
+
+// ─── CLASSROOM ROUTES ─────────────────────────────────────────────────────────
+
+// 10. Get Course Classroom Data (Curriculum + Student Progress)
+router.get('/courses/:courseId/classroom', verifyToken, async (req, res) => {
+  const { uid } = req.user;
+  const { courseId } = req.params;
+
+  try {
+    // 1. Fetch the course document
+    const courseDoc = await db.collection('courses').doc(courseId).get();
+    if (!courseDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Course not found' });
+    }
+
+    const courseData = { id: courseDoc.id, ...courseDoc.data() };
+    const curriculum = courseData.curriculum || [];
+
+    // 2. Fetch student progress for this course
+    const progressSnapshot = await db.collection('student_progress')
+      .where('studentId', '==', uid)
+      .where('courseId', '==', courseId)
+      .limit(1)
+      .get();
+
+    let completedLessons = [];
+    if (!progressSnapshot.empty) {
+      completedLessons = progressSnapshot.docs[0].data().completedLessons || [];
+    }
+
+    // 3. Calculate total lessons and progress percentage
+    let totalLessons = 0;
+    curriculum.forEach(module => {
+      totalLessons += (module.lessons || []).length;
+    });
+
+    const progressPercentage = totalLessons > 0 
+      ? Math.round((completedLessons.length / totalLessons) * 100) 
+      : 0;
+
+    res.status(200).json({
+      success: true,
+      course: {
+        id: courseData.id,
+        name: courseData.name,
+        thumbnailUrl: courseData.thumbnailUrl,
+        duration: courseData.duration
+      },
+      curriculum,
+      completedLessons,
+      progressPercentage,
+      totalLessons
+    });
+  } catch (error) {
+    console.error('Fetch Classroom Data Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching classroom data' });
+  }
+});
+
+// 11. Mark Lesson as Complete
+router.post('/courses/:courseId/lessons/:lessonId/complete', verifyToken, async (req, res) => {
+  const { uid } = req.user;
+  const { courseId, lessonId } = req.params;
+
+  try {
+    // 1. Fetch course to validate lesson exists and check sequential order
+    const courseDoc = await db.collection('courses').doc(courseId).get();
+    if (!courseDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Course not found' });
+    }
+
+    const curriculum = courseDoc.data().curriculum || [];
+    
+    // Build flat list of all lesson IDs in order
+    const allLessonIds = [];
+    curriculum.forEach(module => {
+      (module.lessons || []).forEach(lesson => {
+        allLessonIds.push(lesson.id);
+      });
+    });
+
+    const lessonIndex = allLessonIds.indexOf(lessonId);
+    if (lessonIndex === -1) {
+      return res.status(404).json({ success: false, message: 'Lesson not found in curriculum' });
+    }
+
+    // 2. Fetch or create student progress document
+    const progressSnapshot = await db.collection('student_progress')
+      .where('studentId', '==', uid)
+      .where('courseId', '==', courseId)
+      .limit(1)
+      .get();
+
+    let completedLessons = [];
+    let progressDocRef;
+
+    if (progressSnapshot.empty) {
+      // Create new progress document
+      progressDocRef = db.collection('student_progress').doc();
+      completedLessons = [];
+    } else {
+      progressDocRef = progressSnapshot.docs[0].ref;
+      completedLessons = progressSnapshot.docs[0].data().completedLessons || [];
+    }
+
+    // 3. Check if already completed
+    if (completedLessons.includes(lessonId)) {
+      return res.status(200).json({
+        success: true,
+        message: 'Lesson already completed',
+        completedLessons,
+        progressPercentage: Math.round((completedLessons.length / allLessonIds.length) * 100)
+      });
+    }
+
+    // 4. Sequential unlock validation — previous lesson must be completed (except first)
+    if (lessonIndex > 0) {
+      const previousLessonId = allLessonIds[lessonIndex - 1];
+      if (!completedLessons.includes(previousLessonId)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Please complete the previous lesson first'
+        });
+      }
+    }
+
+    // 5. Add lesson to completed list
+    completedLessons.push(lessonId);
+    const progressPercentage = Math.round((completedLessons.length / allLessonIds.length) * 100);
+
+    await progressDocRef.set({
+      studentId: uid,
+      courseId: courseId,
+      completedLessons: completedLessons,
+      progressPercentage: progressPercentage,
+      updatedAt: new Date()
+    }, { merge: true });
+
+    res.status(200).json({
+      success: true,
+      message: 'Lesson marked as complete',
+      completedLessons,
+      progressPercentage
+    });
+  } catch (error) {
+    console.error('Mark Lesson Complete Error:', error);
+    res.status(500).json({ success: false, message: 'Server error marking lesson complete' });
+  }
+});
+
+// 12. Get Course Progress
+router.get('/courses/:courseId/progress', verifyToken, async (req, res) => {
+  const { uid } = req.user;
+  const { courseId } = req.params;
+
+  try {
+    const progressSnapshot = await db.collection('student_progress')
+      .where('studentId', '==', uid)
+      .where('courseId', '==', courseId)
+      .limit(1)
+      .get();
+
+    if (progressSnapshot.empty) {
+      return res.status(200).json({
+        success: true,
+        completedLessons: [],
+        progressPercentage: 0
+      });
+    }
+
+    const data = progressSnapshot.docs[0].data();
+    res.status(200).json({
+      success: true,
+      completedLessons: data.completedLessons || [],
+      progressPercentage: data.progressPercentage || 0
+    });
+  } catch (error) {
+    console.error('Fetch Progress Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching progress' });
   }
 });
 
