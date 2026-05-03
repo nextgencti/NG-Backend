@@ -206,10 +206,36 @@ router.get('/courses', verifyToken, async (req, res) => {
       const enrData = doc.data();
       const courseDoc = await db.collection('courses').doc(enrData.courseId).get();
       if (courseDoc.exists) {
+        const courseData = courseDoc.data();
+        
+        // Calculate total lessons
+        let totalLessons = 0;
+        (courseData.curriculum || []).forEach(module => {
+          totalLessons += (module.lessons || []).length;
+        });
+
+        // Fetch student progress
+        const progressSnap = await db.collection('student_progress')
+          .where('studentId', '==', uid)
+          .where('courseId', '==', courseDoc.id)
+          .limit(1)
+          .get();
+
+        let progress = 0;
+        let completedLessonsCount = 0;
+        if (!progressSnap.empty) {
+          const pData = progressSnap.docs[0].data();
+          completedLessonsCount = (pData.completedLessons || []).length;
+          progress = pData.progressPercentage || 0;
+        }
+
         return { 
           id: courseDoc.id, 
-          ...courseDoc.data(),
-          enrollmentStatus: enrData.status || 'active'
+          ...courseData,
+          enrollmentStatus: enrData.status || 'active',
+          progress: progress,
+          completedModules: completedLessonsCount,
+          totalModules: totalLessons
         };
       }
       return null;
@@ -421,26 +447,107 @@ router.post('/enroll', verifyToken, async (req, res) => {
   }
 });
 
-// 4. Get Student Attendance Stats
-router.get('/attendance', verifyToken, async (req, res) => {
+// 4. Get Student Activity & Auto-Attendance
+router.get('/activity', verifyToken, async (req, res) => {
   const { uid } = req.user;
   try {
-    // Mocking attendance data since we don't have an attendance cron/logger
-    const stats = {
-      totalPresent: 45,
-      totalAbsent: 3,
-      percentage: '93.7%',
-      recent: [
-        { date: '2026-03-07', status: 'present' },
-        { date: '2026-03-06', status: 'present' },
-        { date: '2026-03-05', status: 'absent' }
-      ]
-    };
+    // 1. Get User Last Login
+    const userDoc = await db.collection('users').doc(uid).get();
+    const lastLogin = userDoc.data()?.lastLogin ? userDoc.data().lastLogin.toDate() : null;
+
+    // 2. Get Learning Activity Logs
+    const activitySnapshot = await db.collection('student_activity')
+      .where('studentId', '==', uid)
+      .limit(50)
+      .get();
+
+    const logs = activitySnapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data(),
+      timestamp: doc.data().timestamp?.toDate()
+    }))
+    .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+    .slice(0, 20);
+
+    // 3. Auto-Calculate Attendance (Present if any activity on that date)
+    // We'll check the last 30 days
+    const attendance = [];
+    let presentDays = 0;
+    const today = new Date();
     
-    res.status(200).json({ success: true, stats });
+    for (let i = 0; i < 30; i++) {
+      const date = new Date();
+      date.setDate(today.getDate() - i);
+      const dateStr = date.toISOString().split('T')[0];
+      
+      const hasActivity = logs.some(log => 
+        log.timestamp && log.timestamp.toISOString().split('T')[0] === dateStr
+      );
+
+      if (hasActivity) {
+        presentDays++;
+        attendance.push({ date: dateStr, status: 'present', activity: 'Platform Activity Recorded' });
+      } else {
+        // Only mark absent if it's not today (unless no activity yet today)
+        attendance.push({ date: dateStr, status: 'absent', activity: 'No activity found' });
+      }
+    }
+
+    const attendancePercentage = Math.round((presentDays / 30) * 100);
+
+    // 4. Overall Progress & Top Course
+    const enrollmentsSnapshot = await db.collection('enrollments').where('studentId', '==', uid).get();
+    const courseIds = enrollmentsSnapshot.docs.map(doc => doc.data().courseId);
+    
+    let totalProgress = 0;
+    let topCourse = 'N/A';
+    let maxProgress = -1;
+
+    if (courseIds.length > 0) {
+      const progressSnapshot = await db.collection('student_progress').where('studentId', '==', uid).get();
+      
+      const progressMap = {};
+      progressSnapshot.forEach(doc => {
+        const pData = doc.data();
+        progressMap[pData.courseId] = pData.progressPercentage || 0;
+        totalProgress += pData.progressPercentage || 0;
+      });
+
+      // Find top course
+      for (const cid of courseIds) {
+        const prog = progressMap[cid] || 0;
+        if (prog > maxProgress) {
+          maxProgress = prog;
+          const cDoc = await db.collection('courses').doc(cid).get();
+          topCourse = cDoc.exists ? cDoc.data().name : cid;
+        }
+      }
+
+      totalProgress = Math.round(totalProgress / courseIds.length);
+    }
+
+    res.status(200).json({ 
+      success: true, 
+      stats: {
+        lastLogin,
+        studyTime: '2.4 Hours', // Mocked
+        activeDays: `${presentDays}/30`,
+        progress: `${totalProgress}%`,
+        attendancePercentage: `${attendancePercentage}%`,
+        topCourse
+      },
+      logs,
+      attendance
+    });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Server error fetching attendance' });
+    console.error('Activity Fetch Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching activity' });
   }
+});
+
+// Legacy Alias
+router.get('/attendance', verifyToken, async (req, res) => {
+  res.redirect('/api/student/activity');
 });
 
 // 5. Get Student Tests (Based on their courses)
@@ -688,6 +795,15 @@ router.post('/courses/:courseId/lessons/:lessonId/complete', verifyToken, async 
       progressPercentage: progressPercentage,
       updatedAt: new Date()
     }, { merge: true });
+
+    // 6. Log Activity
+    await db.collection('student_activity').add({
+      studentId: uid,
+      courseId: courseId,
+      type: 'lesson_complete',
+      action: `Completed lesson in ${courseDoc.data().name || 'Course'}`,
+      timestamp: admin.firestore.FieldValue.serverTimestamp()
+    });
 
     res.status(200).json({
       success: true,

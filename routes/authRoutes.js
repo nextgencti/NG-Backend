@@ -114,6 +114,11 @@ router.post('/verify-otp', async (req, res) => {
       await db.collection('users').doc(uid).set(userData);
     } else {
       userData = userDoc.data();
+      // Update lastLogin
+      await db.collection('users').doc(uid).update({
+        lastLogin: admin.firestore.FieldValue.serverTimestamp()
+      });
+      userData.lastLogin = new Date();
     }
 
     // Fetch Institute Name if instituteId exists
@@ -181,11 +186,12 @@ router.post('/google-login', async (req, res) => {
       isNewUser = true;
     } else {
       userData = userDoc.data();
-      // Ensure we merge existing photo/name if not set initially
-      if (!userData.photoURL && picture) {
-        await userDocRef.update({ photoURL: picture });
-        userData.photoURL = picture;
-      }
+      // Update lastLogin and photo
+      const updates = { lastLogin: admin.firestore.FieldValue.serverTimestamp() };
+      if (!userData.photoURL && picture) updates.photoURL = picture;
+      await userDocRef.update(updates);
+      userData.lastLogin = new Date();
+      if (!userData.photoURL && picture) userData.photoURL = picture;
     }
 
     // Fetch Institute Name if instituteId exists

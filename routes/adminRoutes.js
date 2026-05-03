@@ -621,6 +621,7 @@ router.post('/tests', verifyToken, requireRole('admin'), csvUpload.single('quest
       questions: Number(questions) || 0,
       difficulty: difficulty || 'Easy',
       description: description || '',
+      isPublic: req.body.isPublic === 'true' || req.body.isPublic === true,
       status: 'upcoming',
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     };
@@ -814,6 +815,23 @@ router.get('/tests/:testId/results', verifyToken, requireRole('admin'), async (r
   } catch (error) {
     console.error('Fetch Test Results Error:', error);
     res.status(500).json({ success: false, message: 'Server error fetching test results' });
+  }
+});
+
+// 10b. Get Public Test Results (Leads)
+router.get('/tests/public-results', verifyToken, requireRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const snapshot = await db.collection('public_test_results').orderBy('submittedAt', 'desc').get();
+    const results = snapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data(),
+      submittedAt: doc.data().submittedAt ? doc.data().submittedAt.toDate().toISOString() : null
+    }));
+
+    res.status(200).json({ success: true, results });
+  } catch (error) {
+    console.error('Fetch Public Results Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching public leads' });
   }
 });
 

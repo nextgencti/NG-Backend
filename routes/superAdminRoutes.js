@@ -312,5 +312,75 @@ router.post('/institute-requests/:id/reject', verifyToken, requireRole('superadm
   }
 });
 
+// 10. Update Public Test Leaderboard Settings (Auto-Reset)
+router.patch('/tests/:testId/leaderboard-settings', verifyToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const { testId } = req.params;
+    const { autoResetDuration } = req.body; // 'daily', 'weekly', 'monthly', 'never'
+
+    await db.collection('tests').doc(testId).update({
+      leaderboardResetDuration: autoResetDuration || 'never',
+      lastLeaderboardReset: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.status(200).json({ success: true, message: 'Leaderboard settings updated successfully' });
+  } catch (error) {
+    console.error('Update Leaderboard Settings Error:', error);
+    res.status(500).json({ success: false, message: 'Server error updating settings' });
+  }
+});
+
+// 11. Manually Reset Public Leaderboard
+router.post('/tests/:testId/reset-leaderboard', verifyToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const { testId } = req.params;
+    console.log(`[SuperAdmin] Resetting leaderboard for testId: ${testId}`);
+
+    const snapshot = await db.collection('public_test_results')
+      .where('testId', '==', testId)
+      .get();
+
+    console.log(`[SuperAdmin] Found ${snapshot.size} records matching testId: ${testId}`);
+
+    if (snapshot.empty) {
+      // Still return success but with a specific message
+      return res.status(200).json({ 
+        success: true, 
+        message: 'No records found for this test. Leaderboard is already clean.',
+        count: 0 
+      });
+    }
+
+    // Delete in batches
+    const batch = db.batch();
+    snapshot.docs.forEach(doc => {
+      batch.delete(doc.ref);
+    });
+    await batch.commit();
+
+    // Update last reset timestamp
+    await db.collection('tests').doc(testId).update({
+      lastLeaderboardReset: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.status(200).json({ success: true, message: 'Leaderboard reset successfully' });
+  } catch (error) {
+    console.error('Reset Leaderboard Error:', error);
+    res.status(500).json({ success: false, message: 'Server error resetting leaderboard' });
+  }
+});
+
+// 12. Delete Individual Public Test Result (Lead)
+router.delete('/tests/public-results/:id', verifyToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.collection('public_test_results').doc(id).delete();
+    res.status(200).json({ success: true, message: 'Lead deleted successfully' });
+  } catch (error) {
+    console.error('Delete Lead Error:', error);
+    res.status(500).json({ success: false, message: 'Server error deleting lead' });
+  }
+});
+
 module.exports = router;
 

@@ -1,31 +1,57 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const dns = require('dns');
+
+// Force IPv4 first to avoid Firestore connection issues (ENETUNREACH)
+if (dns.setDefaultResultOrder) {
+  dns.setDefaultResultOrder('ipv4first');
+}
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5001;
 
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// Request Logger for Debugging
+app.use((req, res, next) => {
+  console.log(`[${new Date().toLocaleTimeString()}] ${req.method} ${req.url}`);
+  next();
+});
 
 // Basic Route for Health Check
 app.get('/', (req, res) => {
   res.json({ message: 'NextGen API Server is running successfully 🚀' });
 });
 
+app.get('/api/test-direct', (req, res) => {
+  res.json({ success: true, message: 'Direct route is working!' });
+});
+
 // Import and Use Routes
+console.log('📦 Loading Routes...');
 const authRoutes = require('./routes/authRoutes');
 const studentRoutes = require('./routes/studentRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 const superAdminRoutes = require('./routes/superAdminRoutes');
 const configRoutes = require('./routes/configRoutes');
+const publicRoutes = require('./routes/publicRoutes');
 
+console.log('🛠️ Registering Routes...');
 app.use('/api/auth', authRoutes);
 app.use('/api/student', studentRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/superadmin', superAdminRoutes);
 app.use('/api/config', configRoutes);
+app.use('/api/public', publicRoutes);
+
+app.get('/debug-route', (req, res) => {
+  res.json({ success: true, message: 'Debug route without /api works!' });
+});
+
+console.log('✅ Routes Registered');
 
 // Global error handler - catches errors from any route
 app.use((err, req, res, next) => {
