@@ -802,7 +802,7 @@ router.post('/courses/:courseId/lessons/:lessonId/complete', verifyToken, async 
       courseId: courseId,
       type: 'lesson_complete',
       action: `Completed lesson in ${courseDoc.data().name || 'Course'}`,
-      timestamp: admin.firestore.FieldValue.serverTimestamp()
+      timestamp: new Date()
     });
 
     res.status(200).json({
