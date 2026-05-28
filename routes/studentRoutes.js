@@ -1,5 +1,5 @@
 const express = require('express');
-const { db, auth } = require('../config/firebase');
+const { admin, db, auth } = require('../config/firebase');
 const cloudinary = require('../config/cloudinary');
 const verifyToken = require('../middleware/authMiddleware');
 const multer = require('multer');
@@ -248,6 +248,77 @@ router.get('/courses', verifyToken, async (req, res) => {
   } catch (error) {
     console.error('Fetch Enrolled Courses Error:', error);
     res.status(500).json({ success: false, message: 'Server error fetching courses' });
+  }
+});
+
+// Get Completed Test Result Details for Student
+router.get('/tests/:testId/result', verifyToken, async (req, res) => {
+  const { uid } = req.user;
+  const { testId } = req.params;
+
+  console.log(`[Result] Fetching result for studentId=${uid}, testId=${testId}`);
+
+  try {
+    const resultsSnapshot = await db.collection('test_results')
+      .where('studentId', '==', uid)
+      .where('testId', '==', testId)
+      .get();
+
+    if (resultsSnapshot.empty) {
+      // Debug: Check what test_results exist for this student at all
+      const allStudentResults = await db.collection('test_results')
+        .where('studentId', '==', uid)
+        .get();
+      
+      console.log(`[Result] No result found for testId=${testId}. Student has ${allStudentResults.size} total results.`);
+      if (allStudentResults.size > 0) {
+        allStudentResults.docs.forEach(doc => {
+          const d = doc.data();
+          console.log(`[Result]   - resultDoc=${doc.id}, testId=${d.testId}, score=${d.score}`);
+        });
+      }
+
+      // Fallback: Try to find any result for this test by checking test_results without studentId filter
+      // This helps diagnose if the result was stored with a different studentId format
+      const testOnlyResults = await db.collection('test_results')
+        .where('testId', '==', testId)
+        .limit(5)
+        .get();
+      
+      if (!testOnlyResults.empty) {
+        console.log(`[Result] Found ${testOnlyResults.size} results for this testId with OTHER students:`);
+        testOnlyResults.docs.forEach(doc => {
+          const d = doc.data();
+          console.log(`[Result]   - studentId=${d.studentId}, score=${d.score}`);
+        });
+      }
+
+      return res.status(200).json({ success: false, message: 'No result found for this test.', result: null });
+    }
+
+    // Sort results by score (highest first) to show their best performance
+    const results = resultsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    results.sort((a, b) => (b.score || 0) - (a.score || 0));
+    const bestResult = results[0];
+
+    // Fetch test details to get the test title
+    const testDoc = await db.collection('tests').doc(testId).get();
+    const testTitle = testDoc.exists ? testDoc.data().title : 'Completed Test';
+    const testCourse = testDoc.exists ? testDoc.data().course : 'Course';
+
+    console.log(`[Result] Found ${results.length} result(s). Best score: ${bestResult.score}/${bestResult.totalMarks}`);
+
+    res.status(200).json({
+      success: true,
+      result: {
+        ...bestResult,
+        testTitle,
+        testCourse
+      }
+    });
+  } catch (error) {
+    console.error('Fetch Student Test Result Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching test result' });
   }
 });
 
@@ -582,39 +653,62 @@ router.get('/tests', verifyToken, async (req, res) => {
       if (id === 'webdev01') return 'Full Stack Web Development';
       if (id === 'appdev01') return 'App Development Mastery';
       if (id === 'uiux01') return 'UI/UX Design Masterclass';
+      // Bulletproof fallback for other legacy/mock course IDs in database
+      if (id === 'OpkuOM4Yrv1ok8FSCTnY' || id === 'Z6Y453FdcneP2WRc4kqe' || id === 'NybP5qxXEuGI5yar2HKZ' || id === 'eqs5V9lVJyUSE68UAUc7' || id === '96YlDdgTtcyKA5Erz39d') {
+        return 'CCC (Course of computer concepts)';
+      }
       return null;
     }).filter(Boolean); // Remove nulls
 
     if (courseNames.length === 0) return res.status(200).json({ success: true, tests: [] });
 
-    // 3. Fetch tests for ALL these courses
-    // Note: Firestore 'in' query supports up to 10 items. Assuming < 10 enrolled courses for now.
-    // If > 10, we need to batch them.
-    const chunks = [];
-    for (let i = 0; i < courseNames.length; i += 10) {
-      chunks.push(courseNames.slice(i, i + 10));
-    }
+    // Get student's instituteId once
+    const userDoc = await db.collection('users').doc(uid).get();
+    const studentInstId = userDoc.data()?.instituteId;
 
-    let allTests = [];
-    for (const chunk of chunks) {
-      let query = db.collection('tests').where('course', 'in', chunk);
-      
-      // Filter by instituteId if available on the student
-      const userDoc = await db.collection('users').doc(uid).get();
-      const studentInstId = userDoc.data()?.instituteId;
-      
-      if (studentInstId) {
-        query = query.where('instituteId', '==', studentInstId);
-      }
+    // 3. Fetch all tests and filter flexibly in JavaScript to handle:
+    // - Shorthand names (e.g. "CCC" matching "CCC (Course of computer concepts)")
+    // - Case-insensitivity (e.g. "ccc" matching "CCC")
+    // - Global tests (missing instituteId) or institute-specific tests
+    const snapshot = await db.collection('tests').get();
+    const allTests = snapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    })).filter(test => {
+      const testCourseName = (test.course || '').trim().toLowerCase();
+      if (!testCourseName) return false;
+
+      // Check if test course name matches any of the student's enrolled course names loosely
+      const matchesCourse = courseNames.some(cName => {
+        const studentCourseName = cName.trim().toLowerCase();
         
-      const snapshot = await query.get();
+        // Exact match
+        if (studentCourseName === testCourseName) return true;
         
-      const testsArr = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      }));
-      allTests = [...allTests, ...testsArr];
-    }
+        // Loose shorthand matching (e.g. "ccc" in "ccc (course of computer concepts)")
+        // Match if student's course contains test's course (e.g. "CCC (Course...)" contains "CCC")
+        // OR test's course contains student's course (e.g. "CCC" contains "CCC")
+        if (studentCourseName.includes(testCourseName) || testCourseName.includes(studentCourseName)) return true;
+
+        // Clean match (removing all spaces and special characters)
+        const cleanStudent = studentCourseName.replace(/[^a-z0-9]/g, '');
+        const cleanTest = testCourseName.replace(/[^a-z0-9]/g, '');
+        if (cleanStudent && cleanTest && (cleanStudent.includes(cleanTest) || cleanTest.includes(cleanStudent))) return true;
+
+        return false;
+      });
+
+      if (!matchesCourse) return false;
+
+      // Filter by instituteId
+      // Include the test if:
+      // 1. Student has no instituteId (show all course-matching tests)
+      // 2. Test has no instituteId (created by SuperAdmin or global)
+      // 3. Test's instituteId matches the student's instituteId
+      if (!studentInstId) return true;
+      if (!test.instituteId || test.instituteId === 'NONE' || test.instituteId === 'undefined') return true;
+      return test.instituteId === studentInstId;
+    });
 
     // 4. Incorporate Student test results
     const resultsSnapshot = await db.collection('test_results')
@@ -849,4 +943,103 @@ router.get('/courses/:courseId/progress', verifyToken, async (req, res) => {
   }
 });
 
+// 13. Get Student Notifications
+router.get('/notifications', verifyToken, async (req, res) => {
+  const { uid } = req.user;
+
+  try {
+    // 1. Fetch user's instituteId to filter broadcasts
+    const userDoc = await db.collection('users').doc(uid).get();
+    const userInstituteId = userDoc.exists ? userDoc.data().instituteId : null;
+
+    // 2. Fetch notifications where recipientId is either the student's uid or 'all'
+    const snapshot = await db.collection('notifications')
+      .where('recipientId', 'in', [uid, 'all'])
+      .get();
+
+    let notifications = [];
+
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      
+      // Filter out broadcast notifications that do not match student's instituteId
+      if (data.recipientId === 'all') {
+        const notifInstId = data.instituteId;
+        if (notifInstId && notifInstId !== 'all' && notifInstId !== userInstituteId) {
+          return; // Skip this broadcast notification
+        }
+      }
+
+      // Determine if read
+      let isRead = false;
+      if (data.recipientId === 'all') {
+        const readBy = data.readBy || [];
+        isRead = readBy.includes(uid);
+      } else {
+        isRead = data.isRead || false;
+      }
+
+      notifications.push({
+        id: doc.id,
+        title: data.title || '',
+        message: data.message || '',
+        type: data.type || 'info',
+        link: data.link || '',
+        courseId: data.courseId || null,
+        isRead,
+        createdAt: data.createdAt ? data.createdAt.toDate() : new Date()
+      });
+    });
+
+    // Sort by createdAt descending
+    notifications.sort((a, b) => b.createdAt - a.createdAt);
+
+    res.status(200).json({
+      success: true,
+      notifications
+    });
+  } catch (error) {
+    console.error('Fetch Notifications Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching notifications' });
+  }
+});
+
+// 14. Mark Notification as Read
+router.put('/notifications/:id/read', verifyToken, async (req, res) => {
+  const { uid } = req.user;
+  const { id } = req.params;
+
+  try {
+    const notifRef = db.collection('notifications').doc(id);
+    const notifDoc = await notifRef.get();
+
+    if (!notifDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Notification not found' });
+    }
+
+    const data = notifDoc.data();
+
+    if (data.recipientId === 'all') {
+      // Add student uid to the readBy array using arrayUnion
+      await notifRef.update({
+        readBy: admin.firestore.FieldValue.arrayUnion(uid)
+      });
+    } else {
+      // Ensure the student owns this notification
+      if (data.recipientId !== uid) {
+        return res.status(403).json({ success: false, message: 'Unauthorized' });
+      }
+      await notifRef.update({
+        isRead: true
+      });
+    }
+
+    res.status(200).json({ success: true, message: 'Notification marked as read' });
+  } catch (error) {
+    console.error('Mark Notification Read Error:', error);
+    res.status(500).json({ success: false, message: 'Server error marking notification as read' });
+  }
+});
+
 module.exports = router;
+

@@ -353,6 +353,23 @@ router.post('/courses', verifyToken, requireRole('admin'), upload.single('thumbn
 
     const docRef = await db.collection('courses').add(courseData);
 
+    // Create Notification for new course
+    try {
+      const notificationData = {
+        recipientId: 'all',
+        instituteId: req.user.role === 'admin' && req.user.instituteId ? req.user.instituteId : 'all',
+        courseId: docRef.id,
+        title: 'New Course Added!',
+        message: `${name} has just been published. Check it out!`,
+        type: 'course',
+        link: `/dashboard/my-courses`,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      };
+      await db.collection('notifications').add(notificationData);
+    } catch (notifErr) {
+      console.error('Failed to create notification for new course:', notifErr);
+    }
+
     res.status(201).json({ 
       success: true, 
       message: 'Course created successfully', 
@@ -378,10 +395,55 @@ router.put('/courses/:id/curriculum', verifyToken, requireRole('admin'), async (
       return res.status(404).json({ success: false, message: 'Course not found' });
     }
 
+    // Check if new modules or topics were added to trigger a notification
+    const oldCurriculum = courseDoc.data().curriculum || [];
+    let oldTopicsCount = 0;
+    oldCurriculum.forEach(m => oldTopicsCount += (m.topics ? m.topics.length : 0));
+    
+    let newTopicsCount = 0;
+    (curriculum || []).forEach(m => newTopicsCount += (m.topics ? m.topics.length : 0));
+
+    let oldModulesCount = oldCurriculum.length;
+    let newModulesCount = (curriculum || []).length;
+
     await courseRef.update({
       curriculum: curriculum,
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
+
+    // Generate notifications for enrolled students if content increased
+    if (newTopicsCount > oldTopicsCount || newModulesCount > oldModulesCount) {
+      try {
+        const enrollmentsSnapshot = await db.collection('enrollments')
+          .where('courseId', '==', id)
+          .where('status', '==', 'active')
+          .get();
+          
+        if (!enrollmentsSnapshot.empty) {
+          const batch = db.batch();
+          const courseName = courseDoc.data().name || 'a course';
+          
+          enrollmentsSnapshot.docs.forEach(enrDoc => {
+            const studentId = enrDoc.data().studentId;
+            const notifRef = db.collection('notifications').doc();
+            batch.set(notifRef, {
+              recipientId: studentId,
+              instituteId: req.user.role === 'admin' && req.user.instituteId ? req.user.instituteId : 'all',
+              courseId: id,
+              title: 'Course Updated!',
+              message: `New content has been added to ${courseName}.`,
+              type: 'lesson',
+              link: `/dashboard/my-courses/${id}`,
+              isRead: false,
+              createdAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+          });
+          await batch.commit();
+        }
+      } catch (notifErr) {
+        console.error('Failed to send curriculum update notifications:', notifErr);
+      }
+    }
 
     res.status(200).json({ success: true, message: 'Curriculum updated successfully' });
   } catch (error) {
@@ -565,30 +627,42 @@ const parseQuestionsCSV = (buffer) => {
 
   if (lines.length < 2) throw new Error('CSV must have a header row and at least one question');
 
-  // Regex to match CSV fields correctly even if they contain commas inside double quotes
-  const csvRegex = /(".*?"|[^",\s][^",]*[^",\s]|[^",\s])(?=\s*,|\s*$)/g;
-  
   const questions = [];
   for (let i = 1; i < lines.length; i++) {
     const row = lines[i];
+    
+    // Robust character-by-character CSV row parser to support empty fields (like C and D for True/False questions)
     const cols = [];
-    let match;
-    const lineWithTrailingComma = row + ',';
-    while ((match = csvRegex.exec(lineWithTrailingComma)) !== null) {
-      let val = match[0].trim();
-      if (val.startsWith('"') && val.endsWith('"')) {
-        val = val.substring(1, val.length - 1).replace(/""/g, '"');
+    let currentVal = '';
+    let inQuotes = false;
+    for (let charIndex = 0; charIndex < row.length; charIndex++) {
+      const char = row[charIndex];
+      if (char === '"') {
+        inQuotes = !inQuotes;
+        // Handle escaped double quotes (e.g. "")
+        if (charIndex + 1 < row.length && row[charIndex + 1] === '"' && inQuotes) {
+          currentVal += '"';
+          charIndex++;
+        }
+      } else if (char === ',' && !inQuotes) {
+        cols.push(currentVal.trim());
+        currentVal = '';
+      } else {
+        currentVal += char;
       }
-      cols.push(val);
     }
+    cols.push(currentVal.trim());
 
-    if (cols.length < 7) continue;
+    if (cols.length < 7) {
+      console.warn(`DEBUG: Skipping row ${i} because it has only ${cols.length} columns instead of 7. Row: "${row}"`);
+      continue;
+    }
 
     const [question, option_a, option_b, option_c, option_d, correct_answer, marks] = cols;
     questions.push({
       question,
-      options: { A: option_a, B: option_b, C: option_c, D: option_d },
-      correctAnswer: correct_answer.toUpperCase().trim(),
+      options: { A: option_a || '', B: option_b || '', C: option_c || '', D: option_d || '' },
+      correctAnswer: (correct_answer || 'A').toUpperCase().trim(),
       marks: Number(marks) || 1,
     });
   }
@@ -626,7 +700,8 @@ router.post('/tests', verifyToken, requireRole('admin'), csvUpload.single('quest
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    if (req.user.role === 'admin' && req.user.instituteId) {
+    // Stamp instituteId for both admin and superadmin
+    if (req.user.instituteId) {
       testData.instituteId = req.user.instituteId;
     }
 

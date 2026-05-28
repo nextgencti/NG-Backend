@@ -23,6 +23,7 @@
     "uuid": "^13.0.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.14"
+    "nodemon": "^3.1.14",
+    "puppeteer": "^25.1.0"
   }
 }
