@@ -65,6 +65,8 @@ router.get('/students', verifyToken, requireRole('admin'), async (req, res) => {
     let studentsQuery = db.collection('users').where('role', '==', 'student');
     if (req.user.role === 'admin' && req.user.instituteId) {
       studentsQuery = studentsQuery.where('instituteId', '==', req.user.instituteId);
+    } else if (req.user.role === 'superadmin' && req.query.instituteId) {
+      studentsQuery = studentsQuery.where('instituteId', '==', req.query.instituteId);
     }
     const studentsSnapshot = await studentsQuery.get();
     
@@ -209,30 +211,98 @@ router.delete('/students/:id', verifyToken, requireRole(['superadmin', 'admin'])
 
 // 3. Get All Courses
 router.get('/courses', verifyToken, requireRole('admin'), async (req, res) => {
-  // ... (unchanged)
   try {
     let coursesQuery = db.collection('courses');
     if (req.user.role === 'admin' && req.user.instituteId) {
       coursesQuery = coursesQuery.where('instituteId', '==', req.user.instituteId);
+    } else if (req.user.role === 'superadmin' && req.query.instituteId) {
+      coursesQuery = coursesQuery.where('instituteId', '==', req.query.instituteId);
     }
     const coursesSnapshot = await coursesQuery.get();
-    let coursesData = [];
     
+    // Fetch all active institutes to populate names
+    const institutesSnapshot = await db.collection('institutes').get();
+    const institutesMap = {};
+    institutesSnapshot.forEach(doc => {
+      institutesMap[doc.id] = doc.data().name;
+    });
+
+    let coursesData = [];
     coursesSnapshot.forEach(doc => {
-      coursesData.push({ id: doc.id, ...doc.data() });
+      const data = doc.data();
+      coursesData.push({ 
+        id: doc.id, 
+        ...data,
+        instituteName: data.instituteId ? (institutesMap[data.instituteId] || 'Unknown Institute') : 'Global'
+      });
     });
 
     if (coursesData.length === 0) {
       coursesData = [
-        { id: 'webdev01', name: 'Web Development Bootcamp', duration: '6 months', fees: '12000', students: 450, status: 'active' },
-        { id: 'appdev01', name: 'App Development Mastery', duration: '4 months', fees: '15000', students: 312, status: 'active' },
-        { id: 'uiux01', name: 'UI/UX Design Pro', duration: '3 months', fees: '8000', students: 185, status: 'upcoming' }
+        { id: 'webdev01', name: 'Web Development Bootcamp', duration: '6 months', fees: '12000', students: 450, status: 'active', instituteName: 'Global' },
+        { id: 'appdev01', name: 'App Development Mastery', duration: '4 months', fees: '15000', students: 312, status: 'active', instituteName: 'Global' },
+        { id: 'uiux01', name: 'UI/UX Design Pro', duration: '3 months', fees: '8000', students: 185, status: 'upcoming', instituteName: 'Global' }
       ];
     }
 
     res.status(200).json({ success: true, courses: coursesData });
   } catch (error) {
+    console.error('Fetch Courses Error:', error);
     res.status(500).json({ success: false, message: 'Server error fetching courses' });
+  }
+});
+
+// 3c. Delete a Course
+router.delete('/courses/:id', verifyToken, requireRole('admin'), async (req, res) => {
+  const { id } = req.params;
+  const { pin } = req.body;
+
+  if (!pin) {
+    return res.status(400).json({ success: false, message: 'PIN is required to delete a course' });
+  }
+
+  try {
+    const correctSuperAdminPin = process.env.SUPERADMIN_PIN;
+    const correctAdminPin = process.env.ADMIN_PIN;
+    
+    let isValidPin = false;
+    if (req.user.role === 'superadmin' && String(pin) === String(correctSuperAdminPin)) {
+      isValidPin = true;
+    } else if (String(pin) === String(correctAdminPin)) {
+      isValidPin = true;
+    }
+
+    if (!isValidPin) {
+      return res.status(403).json({ success: false, message: 'Invalid PIN provided' });
+    }
+
+    const courseRef = db.collection('courses').doc(id);
+    const courseDoc = await courseRef.get();
+
+    if (!courseDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Course not found' });
+    }
+
+    // Check ownership if user is admin
+    if (req.user.role === 'admin' && courseDoc.data().instituteId !== req.user.instituteId) {
+      return res.status(403).json({ success: false, message: 'Unauthorized to delete this course' });
+    }
+
+    // Delete related enrollments
+    const enrollmentsSnapshot = await db.collection('enrollments').where('courseId', '==', id).get();
+    const batch = db.batch();
+    enrollmentsSnapshot.docs.forEach((doc) => {
+      batch.delete(doc.ref);
+    });
+    
+    // Delete the course
+    batch.delete(courseRef);
+    await batch.commit();
+
+    res.status(200).json({ success: true, message: 'Course deleted successfully' });
+  } catch (error) {
+    console.error('Delete Course Error:', error);
+    res.status(500).json({ success: false, message: 'Server error deleting course' });
   }
 });
 
@@ -242,6 +312,8 @@ router.get('/enrollments/pending', verifyToken, requireRole('admin'), async (req
     let enrollmentsQuery = db.collection('enrollments').where('status', '==', 'pending');
     if (req.user.role === 'admin' && req.user.instituteId) {
       enrollmentsQuery = enrollmentsQuery.where('instituteId', '==', req.user.instituteId);
+    } else if (req.user.role === 'superadmin' && req.query.instituteId) {
+      enrollmentsQuery = enrollmentsQuery.where('instituteId', '==', req.query.instituteId);
     }
     const enrollmentsSnapshot = await enrollmentsQuery.get();
       
@@ -349,6 +421,8 @@ router.post('/courses', verifyToken, requireRole('admin'), upload.single('thumbn
 
     if (req.user.role === 'admin' && req.user.instituteId) {
       courseData.instituteId = req.user.instituteId;
+    } else if (req.user.role === 'superadmin' && req.body.instituteId) {
+      courseData.instituteId = req.body.instituteId;
     }
 
     const docRef = await db.collection('courses').add(courseData);
@@ -363,6 +437,8 @@ router.post('/courses', verifyToken, requireRole('admin'), upload.single('thumbn
         message: `${name} has just been published. Check it out!`,
         type: 'course',
         link: `/dashboard/my-courses`,
+        isRead: false,
+        readBy: [],
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       };
       await db.collection('notifications').add(notificationData);
@@ -551,6 +627,8 @@ router.post('/students', verifyToken, requireRole('admin'), upload.single('profi
 
     if (req.user.role === 'admin' && req.user.instituteId) {
       userData.instituteId = req.user.instituteId;
+    } else if (req.user.role === 'superadmin' && req.body.instituteId) {
+      userData.instituteId = req.body.instituteId;
     }
 
     await db.collection('users').doc(uid).set(userData, { merge: true });
@@ -565,6 +643,8 @@ router.post('/students', verifyToken, requireRole('admin'), upload.single('profi
       };
       if (req.user.role === 'admin' && req.user.instituteId) {
         enrollmentData.instituteId = req.user.instituteId;
+      } else if (req.user.role === 'superadmin' && req.body.instituteId) {
+        enrollmentData.instituteId = req.body.instituteId;
       }
       await db.collection('enrollments').add(enrollmentData);
       
@@ -728,6 +808,25 @@ router.post('/tests', verifyToken, requireRole('admin'), csvUpload.single('quest
       // Update the test's questionCount to reflect actual parsed count
       await testRef.update({ questions: parsedQuestions.length });
       questionCount = parsedQuestions.length;
+    }
+
+    // Generate notification for new test
+    try {
+      const notificationData = {
+        recipientId: 'all',
+        instituteId: req.user.role === 'admin' && req.user.instituteId ? req.user.instituteId : 'all',
+        courseId: null,
+        title: 'New Test Scheduled! 📝',
+        message: `A new test "${testData.title}" has been scheduled for course "${testData.course}".`,
+        type: 'test',
+        link: '/dashboard/tests',
+        isRead: false,
+        readBy: [],
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      };
+      await db.collection('notifications').add(notificationData);
+    } catch (notifErr) {
+      console.error('Failed to create notification for new test:', notifErr);
     }
 
     res.status(201).json({

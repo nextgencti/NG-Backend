@@ -518,6 +518,48 @@ router.post('/enroll', verifyToken, async (req, res) => {
   }
 });
 
+// ─── STUDY TIME TRACKING ───────────────────────────────────────────────────────
+
+// Track Study Time (Heartbeat from frontend — 1 call = 1 minute)
+// In-memory throttle to avoid needing a Firestore composite index
+const studyThrottleMap = new Map();
+
+router.post('/track-study', verifyToken, async (req, res) => {
+  const { uid } = req.user;
+  const { type, referenceId, label, duration } = req.body;
+
+  if (!type || !referenceId) {
+    return res.status(400).json({ success: false, message: 'type and referenceId are required' });
+  }
+
+  try {
+    // Throttle: Prevent duplicate heartbeats within 50 seconds (in-memory)
+    const throttleKey = `${uid}_${type}_${referenceId}`;
+    const now = Date.now();
+    const lastTime = studyThrottleMap.get(throttleKey) || 0;
+    
+    if (now - lastTime < 50 * 1000) {
+      return res.status(200).json({ success: true, message: 'Already tracked' });
+    }
+    
+    studyThrottleMap.set(throttleKey, now);
+
+    await db.collection('student_activity').add({
+      studentId: uid,
+      type: `study_${type}`,       // 'study_classroom' or 'study_test'
+      referenceId: referenceId,     // courseId or testId
+      action: label ? `Studying: ${label}` : `Active on ${type} page`,
+      duration: duration || 1,      // minutes (default 1 minute per heartbeat)
+      timestamp: new Date()
+    });
+
+    res.status(200).json({ success: true, message: 'Study time tracked' });
+  } catch (error) {
+    console.error('Track Study Time Error:', error);
+    res.status(500).json({ success: false, message: 'Server error tracking study time' });
+  }
+});
+
 // 4. Get Student Activity & Auto-Attendance
 router.get('/activity', verifyToken, async (req, res) => {
   const { uid } = req.user;
@@ -529,7 +571,7 @@ router.get('/activity', verifyToken, async (req, res) => {
     // 2. Get Learning Activity Logs
     const activitySnapshot = await db.collection('student_activity')
       .where('studentId', '==', uid)
-      .limit(50)
+      .limit(500)
       .get();
 
     const logs = activitySnapshot.docs.map(doc => ({
@@ -597,15 +639,35 @@ router.get('/activity', verifyToken, async (req, res) => {
       totalProgress = Math.round(totalProgress / courseIds.length);
     }
 
+    // Calculate weekly engagement and dynamic study time
+    const weeklyData = [0, 0, 0, 0, 0, 0, 0];
+    const allLogsForCalc = activitySnapshot.docs.map(doc => doc.data());
+    
+    for (let i = 0; i < 7; i++) {
+      const d = new Date();
+      d.setDate(today.getDate() - (6 - i));
+      const dateStr = d.toISOString().split('T')[0];
+      const dayLogs = allLogsForCalc.filter(l => l.timestamp && l.timestamp.toDate().toISOString().split('T')[0] === dateStr);
+      // Sum actual duration minutes (heartbeat logs have duration=1, lesson_complete fallback=5)
+      weeklyData[i] = dayLogs.reduce((sum, log) => sum + (log.duration || 5), 0);
+    }
+
+    // Study time = sum of weekly chart data (consistent with chart)
+    const weeklyStudyMins = weeklyData.reduce((sum, val) => sum + val, 0);
+    const studyTimeHours = (weeklyStudyMins / 60).toFixed(1) + ' Hours';
+    const honorXp = allLogsForCalc.length * 50;
+
     res.status(200).json({ 
       success: true, 
       stats: {
         lastLogin,
-        studyTime: '2.4 Hours', // Mocked
+        studyTime: studyTimeHours,
         activeDays: `${presentDays}/30`,
         progress: `${totalProgress}%`,
         attendancePercentage: `${attendancePercentage}%`,
-        topCourse
+        topCourse,
+        weeklyData,
+        honorXp
       },
       logs,
       attendance
