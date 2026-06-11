@@ -626,15 +626,17 @@ router.get('/activity', verifyToken, async (req, res) => {
         totalProgress += pData.progressPercentage || 0;
       });
 
-      // Find top course
-      for (const cid of courseIds) {
+      // Find top course in parallel
+      const coursePromises = courseIds.map(cid => db.collection('courses').doc(cid).get());
+      const courseDocs = await Promise.all(coursePromises);
+      courseDocs.forEach((cDoc, idx) => {
+        const cid = courseIds[idx];
         const prog = progressMap[cid] || 0;
         if (prog > maxProgress) {
           maxProgress = prog;
-          const cDoc = await db.collection('courses').doc(cid).get();
           topCourse = cDoc.exists ? cDoc.data().name : cid;
         }
-      }
+      });
 
       totalProgress = Math.round(totalProgress / courseIds.length);
     }

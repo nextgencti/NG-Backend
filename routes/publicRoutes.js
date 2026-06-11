@@ -299,4 +299,114 @@ router.get('/leaderboard', async (req, res) => {
   }
 });
 
+// 6. Get public statistics/metrics for landing page
+router.get('/stats', async (req, res) => {
+  try {
+    const settingsDoc = await db.collection('settings').doc('web_controls').get();
+    
+    let showStats = true;
+    let dataSource = 'real';
+    let dummyData = {
+      studentsCount: 14,
+      coursesCount: 1,
+      successRate: 95,
+      certificatesCount: 24
+    };
+
+    if (settingsDoc.exists) {
+      const data = settingsDoc.data();
+      if (data.homepageStats) {
+        showStats = data.homepageStats.showStats !== false;
+        dataSource = data.homepageStats.dataSource || 'real';
+        if (data.homepageStats.dummyData) {
+          dummyData = { ...dummyData, ...data.homepageStats.dummyData };
+        }
+      }
+    }
+
+    let stats = {};
+
+    if (dataSource === 'real') {
+      const studentsSnapshot = await db.collection('users').where('role', '==', 'student').get();
+      const coursesSnapshot = await db.collection('courses').get();
+      const resultsSnapshot = await db.collection('test_results').get();
+      
+      const dbStudents = studentsSnapshot.size;
+      const dbCourses = coursesSnapshot.size;
+      const dbTestResults = resultsSnapshot.size;
+
+      stats = {
+        studentsCount: dbStudents, 
+        coursesCount: dbCourses,
+        successRate: 95,
+        certificatesCount: dbTestResults,
+      };
+    } else {
+      stats = {
+        studentsCount: Number(dummyData.studentsCount) || 0,
+        coursesCount: Number(dummyData.coursesCount) || 0,
+        successRate: Number(dummyData.successRate) || 0,
+        certificatesCount: Number(dummyData.certificatesCount) || 0,
+      };
+    }
+
+    res.status(200).json({ success: true, showStats, stats });
+  } catch (error) {
+    console.error('Public Stats Fetch Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching stats' });
+  }
+});
+
+// 7. Get public active courses for landing page
+router.get('/courses', async (req, res) => {
+  try {
+    const snapshot = await db.collection('courses')
+      .where('status', '==', 'active')
+      .get();
+
+    const courses = snapshot.docs.map(doc => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        name: data.name,
+        duration: data.duration,
+        fees: data.fees,
+        thumbnailUrl: data.thumbnailUrl || null,
+        students: data.students || 0,
+        status: data.status,
+        instituteId: data.instituteId || null
+      };
+    });
+
+    res.status(200).json({ success: true, courses });
+  } catch (error) {
+    console.error('Public Courses Fetch Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching courses' });
+  }
+});
+
+// 8. Get all public government services
+router.get('/gov-services', async (req, res) => {
+  try {
+    const snapshot = await db.collection('gov_services').orderBy('createdAt', 'desc').get();
+    const services = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    res.status(200).json({ success: true, services });
+  } catch (error) {
+    console.error('Public Fetch Gov Services Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching government services' });
+  }
+});
+
+// 9. Get all typing paragraphs
+router.get('/typing-paragraphs', async (req, res) => {
+  try {
+    const snapshot = await db.collection('typing_paragraphs').get();
+    const paragraphs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    res.status(200).json({ success: true, paragraphs });
+  } catch (error) {
+    console.error('Public Fetch Typing Paragraphs Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching typing paragraphs' });
+  }
+});
+
 module.exports = router;

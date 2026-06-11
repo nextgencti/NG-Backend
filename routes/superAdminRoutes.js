@@ -3,6 +3,8 @@ const { admin, db, auth } = require('../config/firebase');
 const verifyToken = require('../middleware/authMiddleware');
 const requireRole = require('../middleware/roleMiddleware');
 const emailService = require('../utils/emailService');
+const upload = require('../middleware/uploadMiddleware');
+const cloudinary = require('../config/cloudinary');
 const router = express.Router();
 
 
@@ -379,6 +381,254 @@ router.delete('/tests/public-results/:id', verifyToken, requireRole('superadmin'
   } catch (error) {
     console.error('Delete Lead Error:', error);
     res.status(500).json({ success: false, message: 'Server error deleting lead' });
+  }
+});
+
+// 13. Get Web Controls Settings
+router.get('/web-controls', verifyToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const docRef = db.collection('settings').doc('web_controls');
+    const doc = await docRef.get();
+    
+    const defaultSettings = {
+      homepageStats: {
+        showStats: true,
+        dataSource: 'dummy',
+        dummyData: {
+          studentsCount: 14,
+          coursesCount: 1,
+          successRate: 95,
+          certificatesCount: 24
+        }
+      }
+    };
+
+    if (!doc.exists) {
+      return res.status(200).json({ success: true, settings: defaultSettings });
+    }
+
+    const docData = doc.data();
+    // Merge in case there are missing fields in future updates
+    const settings = {
+      homepageStats: {
+        ...defaultSettings.homepageStats,
+        ...(docData.homepageStats || {})
+      }
+    };
+
+    res.status(200).json({ success: true, settings });
+  } catch (error) {
+    console.error('Fetch Web Controls Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching settings' });
+  }
+});
+
+// 14. Update Web Controls Settings
+router.post('/web-controls', verifyToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const { homepageStats } = req.body;
+    
+    if (!homepageStats) {
+      return res.status(400).json({ success: false, message: 'Invalid settings data' });
+    }
+
+    const docRef = db.collection('settings').doc('web_controls');
+    await docRef.set({ homepageStats }, { merge: true });
+
+    res.status(200).json({ success: true, message: 'Settings updated successfully' });
+  } catch (error) {
+    console.error('Update Web Controls Error:', error);
+    res.status(500).json({ success: false, message: 'Server error updating settings' });
+  }
+});
+
+// Utility for uploading memory buffer to cloudinary
+const uploadToCloudinary = (fileBuffer, folder, mimetype = '') => {
+  return new Promise((resolve, reject) => {
+    const resourceType = mimetype === 'application/pdf' ? 'raw' : 'auto';
+    const uploadStream = cloudinary.uploader.upload_stream(
+      { 
+        folder: folder,
+        resource_type: resourceType
+      },
+      (error, result) => {
+        if (error) reject(error);
+        else resolve(result);
+      }
+    );
+    uploadStream.end(fileBuffer);
+  });
+};
+
+// 15. Get All Government Services
+router.get('/gov-services', verifyToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const snapshot = await db.collection('gov_services').orderBy('createdAt', 'desc').get();
+    const services = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    res.status(200).json({ success: true, services });
+  } catch (error) {
+    console.error('Fetch Gov Services Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching government services' });
+  }
+});
+
+// 16. Create Government Service
+router.post('/gov-services', verifyToken, requireRole('superadmin'), upload.single('image'), async (req, res) => {
+  try {
+    const { name, tagline, description, link, category } = req.body;
+    let imageUrl = null;
+
+    if (!name || !link || !category) {
+      return res.status(400).json({ success: false, message: 'Name, link, and category are required' });
+    }
+
+    if (req.file) {
+      const result = await uploadToCloudinary(req.file.buffer, 'gov_services', req.file.mimetype);
+      imageUrl = result.secure_url;
+    }
+
+    const serviceData = {
+      name,
+      tagline: tagline || '',
+      description: description || '',
+      link,
+      category,
+      imageUrl,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    const docRef = await db.collection('gov_services').add(serviceData);
+
+    res.status(201).json({
+      success: true,
+      message: 'Government service created successfully',
+      service: { id: docRef.id, ...serviceData }
+    });
+  } catch (error) {
+    console.error('Create Gov Service Error:', error);
+    res.status(500).json({ success: false, message: 'Server error creating government service' });
+  }
+});
+
+// 17. Update Government Service
+router.put('/gov-services/:id', verifyToken, requireRole('superadmin'), upload.single('image'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, tagline, description, link, category } = req.body;
+
+    const docRef = db.collection('gov_services').doc(id);
+    const doc = await docRef.get();
+
+    if (!doc.exists) {
+      return res.status(404).json({ success: false, message: 'Government service not found' });
+    }
+
+    const updateData = {
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    if (name !== undefined) updateData.name = name;
+    if (tagline !== undefined) updateData.tagline = tagline;
+    if (description !== undefined) updateData.description = description;
+    if (link !== undefined) updateData.link = link;
+    if (category !== undefined) updateData.category = category;
+
+    if (req.file) {
+      const result = await uploadToCloudinary(req.file.buffer, 'gov_services', req.file.mimetype);
+      updateData.imageUrl = result.secure_url;
+    }
+
+    await docRef.update(updateData);
+
+    res.status(200).json({
+      success: true,
+      message: 'Government service updated successfully',
+      service: { id, ...doc.data(), ...updateData }
+    });
+  } catch (error) {
+    console.error('Update Gov Service Error:', error);
+    res.status(500).json({ success: false, message: 'Server error updating government service' });
+  }
+});
+
+// 18. Delete Government Service
+router.delete('/gov-services/:id', verifyToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const docRef = db.collection('gov_services').doc(id);
+    const doc = await docRef.get();
+
+    if (!doc.exists) {
+      return res.status(404).json({ success: false, message: 'Government service not found' });
+    }
+
+    await docRef.delete();
+
+    res.status(200).json({ success: true, message: 'Government service deleted successfully' });
+  } catch (error) {
+    console.error('Delete Gov Service Error:', error);
+    res.status(500).json({ success: false, message: 'Server error deleting government service' });
+  }
+});
+
+// 19. Get All Typing Paragraphs
+router.get('/typing-paragraphs', verifyToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const snapshot = await db.collection('typing_paragraphs').orderBy('createdAt', 'desc').get();
+    const paragraphs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    res.status(200).json({ success: true, paragraphs });
+  } catch (error) {
+    console.error('Fetch Typing Paragraphs Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching typing paragraphs' });
+  }
+});
+
+// 20. Create Typing Paragraph
+router.post('/typing-paragraphs', verifyToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const { language, mode, text } = req.body;
+    
+    if (!language || !mode || !text) {
+      return res.status(400).json({ success: false, message: 'Language, mode, and text are required' });
+    }
+
+    const paragraphData = {
+      language, // 'english', 'javascript', 'numbers'
+      mode, // 'normal', 'advanced'
+      text,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    const docRef = await db.collection('typing_paragraphs').add(paragraphData);
+
+    res.status(201).json({ 
+      success: true, 
+      message: 'Typing paragraph created successfully',
+      paragraph: { id: docRef.id, ...paragraphData }
+    });
+  } catch (error) {
+    console.error('Create Typing Paragraph Error:', error);
+    res.status(500).json({ success: false, message: 'Server error creating paragraph' });
+  }
+});
+
+// 21. Delete Typing Paragraph
+router.delete('/typing-paragraphs/:id', verifyToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const docRef = db.collection('typing_paragraphs').doc(id);
+    const doc = await docRef.get();
+
+    if (!doc.exists) {
+      return res.status(404).json({ success: false, message: 'Paragraph not found' });
+    }
+
+    await docRef.delete();
+    res.status(200).json({ success: true, message: 'Paragraph deleted successfully' });
+  } catch (error) {
+    console.error('Delete Typing Paragraph Error:', error);
+    res.status(500).json({ success: false, message: 'Server error deleting paragraph' });
   }
 });
 
