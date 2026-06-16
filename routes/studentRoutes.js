@@ -1105,5 +1105,80 @@ router.put('/notifications/:id/read', verifyToken, async (req, res) => {
   }
 });
 
+// 15. Save Typing Score (Protected)
+router.post('/typing-scores', verifyToken, async (req, res) => {
+  const { uid } = req.user;
+  const { gameName, wpm, accuracy, score, difficulty } = req.body;
+
+  if (!gameName || wpm === undefined || accuracy === undefined) {
+    return res.status(400).json({ success: false, message: 'gameName, wpm, and accuracy are required' });
+  }
+
+  try {
+    const userDoc = await db.collection('users').doc(uid).get();
+    const studentName = userDoc.exists ? (userDoc.data().name || 'Student') : 'Student';
+
+    const scoreData = {
+      studentId: uid,
+      studentName,
+      gameName,
+      wpm: Number(wpm),
+      accuracy: Number(accuracy),
+      score: score !== undefined ? Number(score) : 0,
+      difficulty: difficulty || 'medium',
+      createdAt: new Date()
+    };
+
+    await db.collection('typing_scores').add(scoreData);
+
+    res.status(201).json({
+      success: true,
+      message: 'Typing score saved successfully',
+      data: scoreData
+    });
+  } catch (error) {
+    console.error('Save Typing Score Error:', error);
+    res.status(500).json({ success: false, message: 'Server error saving typing score' });
+  }
+});
+
+// 16. Get Student's Typing Scores/Stats
+router.get('/typing-scores/stats', verifyToken, async (req, res) => {
+  const { uid } = req.user;
+
+  try {
+    const snapshot = await db.collection('typing_scores')
+      .where('studentId', '==', uid)
+      .get();
+
+    const scores = snapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data(),
+      createdAt: doc.data().createdAt ? doc.data().createdAt.toDate() : new Date()
+    }));
+
+    // Sort by date desc
+    scores.sort((a, b) => b.createdAt - a.createdAt);
+
+    // Calculate bests per game
+    const bests = {};
+    scores.forEach(s => {
+      const g = s.gameName;
+      if (!bests[g] || s.wpm > bests[g].wpm) {
+        bests[g] = s;
+      }
+    });
+
+    res.status(200).json({
+      success: true,
+      recent: scores.slice(0, 10),
+      bests
+    });
+  } catch (error) {
+    console.error('Fetch Typing Score Stats Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching typing score stats' });
+  }
+});
+
 module.exports = router;
 
