@@ -397,7 +397,7 @@ router.put('/enrollments/:id/status', verifyToken, requireRole('admin'), async (
 // 4. Create New Course
 router.post('/courses', verifyToken, requireRole('admin'), upload.single('thumbnail'), async (req, res) => {
   try {
-    const { name, duration, fees, status } = req.body;
+    const { name, duration, fees, status, courseFeeType, monthlyFee, fixedFee } = req.body;
     let thumbnailUrl = null;
 
     if (!name || !duration || !fees) {
@@ -413,6 +413,9 @@ router.post('/courses', verifyToken, requireRole('admin'), upload.single('thumbn
       name,
       duration,
       fees: Number(fees),
+      courseFeeType: courseFeeType || 'fixed',
+      monthlyFee: monthlyFee ? Number(monthlyFee) : 0,
+      fixedFee: fixedFee ? Number(fixedFee) : Number(fees),
       status: status || 'active',
       students: 0,
       thumbnailUrl,
@@ -436,7 +439,7 @@ router.post('/courses', verifyToken, requireRole('admin'), upload.single('thumbn
         title: 'New Course Added!',
         message: `${name} has just been published. Check it out!`,
         type: 'course',
-        link: `/dashboard/my-courses`,
+        link: `/dashboard/courses`,
         isRead: false,
         readBy: [],
         createdAt: admin.firestore.FieldValue.serverTimestamp()
@@ -509,7 +512,7 @@ router.put('/courses/:id/curriculum', verifyToken, requireRole('admin'), async (
               title: 'Course Updated!',
               message: `New content has been added to ${courseName}.`,
               type: 'lesson',
-              link: `/dashboard/my-courses/${id}`,
+              link: `/dashboard/courses/${id}/classroom`,
               isRead: false,
               createdAt: admin.firestore.FieldValue.serverTimestamp()
             });
@@ -1236,6 +1239,493 @@ router.put('/institute', verifyToken, requireRole('admin'), upload.single('logo'
   }
 });
 
+
+// ─── FINANCE & FEES MANAGEMENT ENDPOINTS ──────────────────────────────────────
+
+// Helper to generate enrolled months list
+const getEnrolledMonthsList = (createdAt, duration, feeType = 'fixed') => {
+  const months = [];
+  let start = new Date();
+  if (createdAt) {
+    if (typeof createdAt.toDate === 'function') {
+      start = createdAt.toDate();
+    } else {
+      start = new Date(createdAt);
+    }
+  }
+  
+  const startYear = start.getFullYear();
+  const startMonth = start.getMonth(); // 0-indexed
+  
+  let totalMonths = 1;
+  if (feeType === 'monthly') {
+    // Unlimited study duration: generate from start month up to the current calendar month
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    const currentMonth = now.getMonth();
+    const diffMonths = (currentYear - startYear) * 12 + (currentMonth - startMonth);
+    totalMonths = Math.max(1, diffMonths + 1); // At least the enrollment month
+  } else {
+    // Fixed amount duration limit
+    const durationMatch = duration ? String(duration).match(/\d+/) : null;
+    totalMonths = durationMatch ? parseInt(durationMatch[0]) : 1;
+  }
+  
+  for (let i = 0; i < totalMonths; i++) {
+    const d = new Date(startYear, startMonth + i, 1);
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    months.push(`${year}-${month}`);
+  }
+  return months;
+};
+
+// Helper to calculate monthly fee details (including pro-rata for first month)
+const calculateMonthlyFeeDetails = (createdAt, netFee, monthsList) => {
+  const details = {};
+  let totalCost = 0;
+  let start = new Date();
+  if (createdAt) {
+    if (typeof createdAt.toDate === 'function') {
+      start = createdAt.toDate();
+    } else {
+      start = new Date(createdAt);
+    }
+  }
+  
+  monthsList.forEach((m, idx) => {
+    if (idx === 0) {
+      // Pro-rata for the first month
+      const daysInFirstMonth = new Date(start.getFullYear(), start.getMonth() + 1, 0).getDate();
+      const studyDays = daysInFirstMonth - start.getDate() + 1;
+      const firstMonthFee = Math.round((studyDays / daysInFirstMonth) * netFee);
+      details[m] = firstMonthFee;
+      totalCost += firstMonthFee;
+    } else {
+      details[m] = netFee;
+      totalCost += netFee;
+    }
+  });
+  
+  return { details, totalCost };
+};
+
+// GET /admin/finance/summary
+router.get('/finance/summary', verifyToken, requireRole('admin'), async (req, res) => {
+  try {
+    const instituteId = req.user.role === 'admin' && req.user.instituteId ? req.user.instituteId : null;
+    
+    // Fetch all courses
+    let coursesQuery = db.collection('courses');
+    if (instituteId) {
+      coursesQuery = coursesQuery.where('instituteId', '==', instituteId);
+    }
+    const coursesSnapshot = await coursesQuery.get();
+    const coursesMap = {};
+    coursesSnapshot.forEach(doc => {
+      coursesMap[doc.id] = doc.data();
+    });
+    
+    // Fetch all students
+    let studentsQuery = db.collection('users').where('role', '==', 'student');
+    if (instituteId) {
+      studentsQuery = studentsQuery.where('instituteId', '==', instituteId);
+    }
+    const studentsSnapshot = await studentsQuery.get();
+    
+    let totalDues = 0;
+    let studentsCount = studentsSnapshot.size;
+    let delinquentCount = 0;
+    
+    studentsSnapshot.forEach(doc => {
+      const student = doc.data();
+      const course = coursesMap[student.courseId];
+      if (!course) return; // Skip if no course linked
+      
+      const config = student.feeConfig || {};
+      const feeType = config.feeType || course.courseFeeType || 'fixed';
+      
+      let baseFee = 0;
+      if (feeType === 'monthly') {
+        baseFee = config.amount !== undefined && config.amount !== null ? Number(config.amount) : (course.monthlyFee || 0);
+      } else {
+        baseFee = config.amount !== undefined && config.amount !== null ? Number(config.amount) : (course.fixedFee || Number(course.fees) || 0);
+      }
+      
+      // Calculate discount
+      let discountAmount = 0;
+      const discountType = config.discountType || 'none';
+      const discountVal = Number(config.discountValue) || 0;
+      
+      if (discountType === 'flat') {
+        discountAmount = discountVal;
+      } else if (discountType === 'percentage') {
+        discountAmount = (baseFee * discountVal) / 100;
+      }
+      
+      const netFee = Math.max(0, baseFee - discountAmount);
+      
+      let totalStudentFee = 0;
+      let studentPaidAmount = Number(student.paidAmount) || 0;
+      
+      if (feeType === 'monthly') {
+        const monthsList = getEnrolledMonthsList(student.createdAt, course.duration, 'monthly');
+        const feeCalc = calculateMonthlyFeeDetails(student.createdAt, netFee, monthsList);
+        totalStudentFee = feeCalc.totalCost;
+      } else {
+        totalStudentFee = netFee;
+      }
+      
+      const studentDue = Math.max(0, totalStudentFee - studentPaidAmount);
+      totalDues += studentDue;
+      
+      if (studentDue > 0) {
+        delinquentCount++;
+      }
+    });
+    
+    // Fetch payments/transactions
+    let paymentsQuery = db.collection('fee_payments');
+    if (instituteId) {
+      paymentsQuery = paymentsQuery.where('instituteId', '==', instituteId);
+    }
+    const paymentsSnapshot = await paymentsQuery.get();
+    
+    let totalRevenue = 0;
+    const transactions = [];
+    
+    paymentsSnapshot.forEach(doc => {
+      const p = doc.data();
+      totalRevenue += Number(p.amount) || 0;
+      
+      transactions.push({
+        id: doc.id,
+        ...p,
+        date: p.paidAt ? new Date(p.paidAt.toDate()).toLocaleDateString() : 'N/A'
+      });
+    });
+    
+    // Sort transactions in JS (to avoid composite index index creation issues)
+    transactions.sort((a, b) => {
+      const dateA = a.paidAt ? (typeof a.paidAt.toDate === 'function' ? a.paidAt.toDate() : new Date(a.paidAt)) : 0;
+      const dateB = b.paidAt ? (typeof b.paidAt.toDate === 'function' ? b.paidAt.toDate() : new Date(b.paidAt)) : 0;
+      return dateB - dateA;
+    });
+    
+    res.status(200).json({
+      success: true,
+      stats: {
+        totalRevenue,
+        totalDues,
+        delinquentCount,
+        studentsCount
+      },
+      transactions: transactions.slice(0, 15) // send top 15
+    });
+  } catch (error) {
+    console.error('Fetch Finance Summary Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching financial overview' });
+  }
+});
+
+// GET /admin/finance/students
+router.get('/finance/students', verifyToken, requireRole('admin'), async (req, res) => {
+  try {
+    const instituteId = req.user.role === 'admin' && req.user.instituteId ? req.user.instituteId : null;
+    
+    // Fetch courses map
+    let coursesQuery = db.collection('courses');
+    if (instituteId) {
+      coursesQuery = coursesQuery.where('instituteId', '==', instituteId);
+    }
+    const coursesSnapshot = await coursesQuery.get();
+    const coursesMap = {};
+    coursesSnapshot.forEach(doc => {
+      coursesMap[doc.id] = { id: doc.id, ...doc.data() };
+    });
+    
+    // Fetch students
+    let studentsQuery = db.collection('users').where('role', '==', 'student');
+    if (instituteId) {
+      studentsQuery = studentsQuery.where('instituteId', '==', instituteId);
+    }
+    const studentsSnapshot = await studentsQuery.get();
+    
+    const studentsData = [];
+    
+    studentsSnapshot.forEach(doc => {
+      const s = doc.data();
+      const course = coursesMap[s.courseId];
+      
+      if (!course) {
+        // Enrolled in nothing or deleted course
+        studentsData.push({
+          id: doc.id,
+          name: s.name || s.fullName || 'Unknown Student',
+          rollNumber: s.rollNumber || 'N/A',
+          courseName: 'No Enrolled Course',
+          feeType: 'fixed',
+          baseFee: 0,
+          discountText: '—',
+          paidAmount: 0,
+          totalDue: 0,
+          dueMonths: [],
+          paidMonths: [],
+          allMonths: []
+        });
+        return;
+      }
+      
+      const config = s.feeConfig || {};
+      const feeType = config.feeType || course.courseFeeType || 'fixed';
+      
+      let baseFee = 0;
+      if (feeType === 'monthly') {
+        baseFee = config.amount !== undefined && config.amount !== null ? Number(config.amount) : (course.monthlyFee || 0);
+      } else {
+        baseFee = config.amount !== undefined && config.amount !== null ? Number(config.amount) : (course.fixedFee || Number(course.fees) || 0);
+      }
+      
+      // Discount
+      let discountAmount = 0;
+      let discountText = 'None';
+      const discountType = config.discountType || 'none';
+      const discountVal = Number(config.discountValue) || 0;
+      
+      if (discountType === 'flat') {
+        discountAmount = discountVal;
+        discountText = `₹${discountVal} Off`;
+      } else if (discountType === 'percentage') {
+        discountAmount = (baseFee * discountVal) / 100;
+        discountText = `${discountVal}% Off`;
+      }
+      
+      const netFee = Math.max(0, baseFee - discountAmount);
+      
+      let totalCost = 0;
+      const allMonths = getEnrolledMonthsList(s.createdAt, course.duration, feeType);
+      const paidMonths = s.paidMonths || [];
+      let monthlyFeeDetails = {};
+      
+      if (feeType === 'monthly') {
+        const feeCalc = calculateMonthlyFeeDetails(s.createdAt, netFee, allMonths);
+        monthlyFeeDetails = feeCalc.details;
+        totalCost = feeCalc.totalCost;
+      } else {
+        totalCost = netFee;
+      }
+      
+      const paidAmount = Number(s.paidAmount) || 0;
+      const totalDue = Math.max(0, totalCost - paidAmount);
+      
+      // Determine due months for monthly students
+      let dueMonths = [];
+      if (feeType === 'monthly') {
+        dueMonths = allMonths.filter(m => !paidMonths.includes(m));
+      }
+      
+      studentsData.push({
+        id: doc.id,
+        name: s.name || s.fullName || 'Unknown Student',
+        rollNumber: s.rollNumber || 'N/A',
+        courseId: course.id,
+        courseName: course.name,
+        createdAt: s.createdAt ? (typeof s.createdAt.toDate === 'function' ? s.createdAt.toDate().toISOString() : s.createdAt) : new Date().toISOString(),
+        feeType,
+        baseFee,
+        discountType,
+        discountValue: discountVal,
+        discountText,
+        paidAmount,
+        totalDue,
+        dueMonths,
+        paidMonths,
+        allMonths,
+        monthlyFeeDetails
+      });
+    });
+    
+    res.status(200).json({ success: true, students: studentsData });
+  } catch (error) {
+    console.error('Fetch Finance Students Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching student fees' });
+  }
+});
+
+// POST /admin/finance/students/:studentId/config
+router.post('/finance/students/:studentId/config', verifyToken, requireRole('admin'), async (req, res) => {
+  const { studentId } = req.params;
+  const { feeType, amount, discountType, discountValue } = req.body;
+  
+  if (!feeType || !['monthly', 'fixed'].includes(feeType)) {
+    return res.status(400).json({ success: false, message: 'Invalid fee type' });
+  }
+  
+  try {
+    const studentRef = db.collection('users').doc(studentId);
+    const studentDoc = await studentRef.get();
+    
+    if (!studentDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Student not found' });
+    }
+    
+    const feeConfig = {
+      feeType,
+      amount: amount !== '' && amount !== undefined && amount !== null ? Number(amount) : null,
+      discountType: discountType || 'none',
+      discountValue: discountValue ? Number(discountValue) : 0
+    };
+    
+    await studentRef.update({
+      feeConfig,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    
+    res.status(200).json({ success: true, message: 'Fee configuration updated successfully' });
+  } catch (error) {
+    console.error('Update Fee Config Error:', error);
+    res.status(500).json({ success: false, message: 'Server error saving fee config' });
+  }
+});
+
+// POST /admin/finance/pay-fee
+router.post('/finance/pay-fee', verifyToken, requireRole('admin'), async (req, res) => {
+  const { studentId, amount, paymentMethod, paymentType, months, notes, discountApplied } = req.body;
+  
+  if (!studentId || amount === undefined || !paymentMethod || !paymentType) {
+    return res.status(400).json({ success: false, message: 'Missing required payment fields' });
+  }
+  
+  try {
+    const studentRef = db.collection('users').doc(studentId);
+    const studentDoc = await studentRef.get();
+    
+    if (!studentDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Student not found' });
+    }
+    
+    const s = studentDoc.data();
+    
+    // Fetch course details
+    if (!s.courseId) {
+      return res.status(400).json({ success: false, message: 'Student is not enrolled in a course' });
+    }
+    const courseDoc = await db.collection('courses').doc(s.courseId).get();
+    if (!courseDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Enrolled course details not found' });
+    }
+    const course = courseDoc.data();
+    
+    // Calculate receipt number inside a transaction
+    let receiptNo = 'REC-1001';
+    await db.runTransaction(async (transaction) => {
+      const counterRef = db.collection('counters').doc('receipts');
+      const counterDoc = await transaction.get(counterRef);
+      
+      let nextCount = 1001;
+      if (!counterDoc.exists) {
+        transaction.set(counterRef, { count: 1001 });
+      } else {
+        nextCount = (counterDoc.data().count || 1000) + 1;
+        transaction.update(counterRef, { count: nextCount });
+      }
+      receiptNo = `REC-${nextCount}`;
+    });
+    
+    const discountVal = Number(discountApplied) || 0;
+    
+    // Create payments transaction document
+    const paymentData = {
+      studentId,
+      studentName: s.name || s.fullName || 'Unknown Student',
+      studentRollNumber: s.rollNumber || 'N/A',
+      courseId: s.courseId,
+      courseName: course.name,
+      amount: Number(amount),
+      discountApplied: discountVal,
+      paymentMethod,
+      paymentType,
+      monthsPaid: months || [],
+      receiptNo,
+      notes: notes || '',
+      paidAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+    
+    if (s.instituteId) {
+      paymentData.instituteId = s.instituteId;
+    }
+    
+    const paymentRef = await db.collection('fee_payments').add(paymentData);
+    
+    // Update student paid states
+    const studentUpdates = {
+      paidAmount: (Number(s.paidAmount) || 0) + Number(amount) + discountVal,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+    
+    if (paymentType === 'monthly' && months && months.length > 0) {
+      const currentPaid = s.paidMonths || [];
+      const newPaid = [...currentPaid];
+      months.forEach(m => {
+        if (!newPaid.includes(m)) {
+          newPaid.push(m);
+        }
+      });
+      studentUpdates.paidMonths = newPaid;
+    }
+    
+    await studentRef.update(studentUpdates);
+    
+    res.status(201).json({
+      success: true,
+      message: 'Payment registered successfully',
+      transaction: {
+        id: paymentRef.id,
+        ...paymentData,
+        date: new Date().toLocaleDateString()
+      }
+    });
+  } catch (error) {
+    console.error('Pay Fee Error:', error);
+    res.status(500).json({ success: false, message: 'Server error processing payment' });
+  }
+});
+
+// GET /admin/finance/transactions
+router.get('/finance/transactions', verifyToken, requireRole('admin'), async (req, res) => {
+  try {
+    const instituteId = req.user.role === 'admin' && req.user.instituteId ? req.user.instituteId : null;
+    
+    let query = db.collection('fee_payments');
+    if (instituteId) {
+      query = query.where('instituteId', '==', instituteId);
+    }
+    
+    const snapshot = await query.get();
+    const transactions = [];
+    
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      transactions.push({
+        id: doc.id,
+        ...data,
+        date: data.paidAt ? new Date(data.paidAt.toDate()).toLocaleDateString() : 'N/A'
+      });
+    });
+    
+    // Sort transactions in JS (to avoid index requirement issues)
+    transactions.sort((a, b) => {
+      const dateA = a.paidAt ? (typeof a.paidAt.toDate === 'function' ? a.paidAt.toDate() : new Date(a.paidAt)) : 0;
+      const dateB = b.paidAt ? (typeof b.paidAt.toDate === 'function' ? b.paidAt.toDate() : new Date(b.paidAt)) : 0;
+      return dateB - dateA;
+    });
+    
+    res.status(200).json({ success: true, transactions });
+  } catch (error) {
+    console.error('Fetch Transactions Error:', error);
+    res.status(500).json({ success: false, message: 'Server error retrieving transaction logs' });
+  }
+});
 
 module.exports = router;
 

@@ -1180,5 +1180,248 @@ router.get('/typing-scores/stats', verifyToken, async (req, res) => {
   }
 });
 
+// Helper to generate enrolled months list
+const getEnrolledMonthsList = (createdAt, duration, feeType = 'fixed') => {
+  const months = [];
+  let start = new Date();
+  if (createdAt) {
+    if (typeof createdAt.toDate === 'function') {
+      start = createdAt.toDate();
+    } else {
+      start = new Date(createdAt);
+    }
+  }
+  
+  const startYear = start.getFullYear();
+  const startMonth = start.getMonth(); // 0-indexed
+  
+  let totalMonths = 1;
+  if (feeType === 'monthly') {
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    const currentMonth = now.getMonth();
+    const diffMonths = (currentYear - startYear) * 12 + (currentMonth - startMonth);
+    totalMonths = Math.max(1, diffMonths + 1); // At least the enrollment month
+  } else {
+    const durationMatch = duration ? String(duration).match(/\d+/) : null;
+    totalMonths = durationMatch ? parseInt(durationMatch[0]) : 1;
+  }
+  
+  for (let i = 0; i < totalMonths; i++) {
+    const d = new Date(startYear, startMonth + i, 1);
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    months.push(`${year}-${month}`);
+  }
+  return months;
+};
+
+// Helper to calculate monthly fee details (including pro-rata for first month)
+const calculateMonthlyFeeDetails = (createdAt, netFee, monthsList) => {
+  const details = {};
+  let totalCost = 0;
+  let start = new Date();
+  if (createdAt) {
+    if (typeof createdAt.toDate === 'function') {
+      start = createdAt.toDate();
+    } else {
+      start = new Date(createdAt);
+    }
+  }
+  
+  monthsList.forEach((m, idx) => {
+    if (idx === 0) {
+      const daysInFirstMonth = new Date(start.getFullYear(), start.getMonth() + 1, 0).getDate();
+      const studyDays = daysInFirstMonth - start.getDate() + 1;
+      const firstMonthFee = Math.round((studyDays / daysInFirstMonth) * netFee);
+      details[m] = firstMonthFee;
+      totalCost += firstMonthFee;
+    } else {
+      details[m] = netFee;
+      totalCost += netFee;
+    }
+  });
+  
+  return { details, totalCost };
+};
+
+// GET /api/student/finance
+router.get('/finance', verifyToken, async (req, res) => {
+  const { uid } = req.user;
+
+  try {
+    const userDoc = await db.collection('users').doc(uid).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    const s = userDoc.data();
+    if (!s.courseId) {
+      return res.status(200).json({
+        success: true,
+        summary: { total: 0, paid: 0, outstanding: 0 },
+        nextPayment: null,
+        history: [],
+        studentDetails: null
+      });
+    }
+
+    const courseDoc = await db.collection('courses').doc(s.courseId).get();
+    if (!courseDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Course not found' });
+    }
+
+    const course = courseDoc.data();
+    const config = s.feeConfig || {};
+    const feeType = config.feeType || course.courseFeeType || 'fixed';
+
+    let baseFee = 0;
+    if (feeType === 'monthly') {
+      baseFee = config.amount !== undefined && config.amount !== null ? Number(config.amount) : (course.monthlyFee || 0);
+    } else {
+      baseFee = config.amount !== undefined && config.amount !== null ? Number(config.amount) : (course.fixedFee || Number(course.fees) || 0);
+    }
+
+    let discountAmount = 0;
+    let discountText = 'None';
+    const discountType = config.discountType || 'none';
+    const discountVal = Number(config.discountValue) || 0;
+
+    if (discountType === 'flat') {
+      discountAmount = discountVal;
+      discountText = `₹${discountVal} Off`;
+    } else if (discountType === 'percentage') {
+      discountAmount = (baseFee * discountVal) / 100;
+      discountText = `${discountVal}% Off`;
+    }
+
+    const netFee = Math.max(0, baseFee - discountAmount);
+    let totalCost = 0;
+    const allMonths = getEnrolledMonthsList(s.createdAt, course.duration, feeType);
+    const paidMonths = s.paidMonths || [];
+    let monthlyFeeDetails = {};
+
+    if (feeType === 'monthly') {
+      const feeCalc = calculateMonthlyFeeDetails(s.createdAt, netFee, allMonths);
+      monthlyFeeDetails = feeCalc.details;
+      totalCost = feeCalc.totalCost;
+    } else {
+      totalCost = netFee;
+    }
+
+    const paidAmount = Number(s.paidAmount) || 0;
+    const totalDue = Math.max(0, totalCost - paidAmount);
+
+    let dueMonths = [];
+    if (feeType === 'monthly') {
+      dueMonths = allMonths.filter(m => !paidMonths.includes(m));
+    }
+
+    // Fetch payment transaction history
+    const historySnap = await db.collection('fee_payments')
+      .where('studentId', '==', uid)
+      .get();
+
+    const history = [];
+    historySnap.forEach(doc => {
+      const hData = doc.data();
+      history.push({
+        id: doc.id,
+        ...hData,
+        date: hData.paidAt ? new Date(hData.paidAt.toDate()).toLocaleDateString() : 'N/A'
+      });
+    });
+
+    // Sort history by date descending
+    history.sort((a, b) => {
+      const dateA = a.paidAt ? (typeof a.paidAt.toDate === 'function' ? a.paidAt.toDate() : new Date(a.paidAt)) : 0;
+      const dateB = b.paidAt ? (typeof b.paidAt.toDate === 'function' ? b.paidAt.toDate() : new Date(b.paidAt)) : 0;
+      return dateB - dateA;
+    });
+
+    // Calculate next payment suggestion
+    let nextPayment = null;
+    if (feeType === 'monthly' && dueMonths.length > 0) {
+      const nextDueMonth = dueMonths[0];
+      const nextDueAmount = monthlyFeeDetails[nextDueMonth] ?? netFee;
+      
+      const [year, month] = nextDueMonth.split('-');
+      const deadlineDate = new Date(parseInt(year), parseInt(month) - 1, 10);
+      const today = new Date();
+      const diffTime = deadlineDate.getTime() - today.getTime();
+      const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+      nextPayment = {
+        amount: nextDueAmount,
+        course: course.name,
+        deadline: deadlineDate.toLocaleDateString('en-US', { day: 'numeric', month: 'short', year: 'numeric' }),
+        daysLeft: Math.max(0, diffDays)
+      };
+    } else if (feeType === 'fixed' && totalDue > 0) {
+      nextPayment = {
+        amount: totalDue,
+        course: course.name,
+        deadline: 'Immediate',
+        daysLeft: 0
+      };
+    }
+
+    res.status(200).json({
+      success: true,
+      summary: {
+        total: totalCost,
+        paid: paidAmount,
+        outstanding: totalDue
+      },
+      nextPayment,
+      history,
+      studentDetails: {
+        feeType,
+        baseFee,
+        discountType,
+        discountValue: discountVal,
+        discountText,
+        dueMonths,
+        paidMonths,
+        allMonths,
+        monthlyFeeDetails
+      }
+    });
+
+  } catch (error) {
+    console.error('Fetch Student Finance Error:', error);
+    res.status(500).json({ success: false, message: 'Server error retrieving finance details' });
+  }
+});
+
+// 14. Get Student's Verified Certificates
+router.get('/certificates', verifyToken, async (req, res) => {
+  const { uid } = req.user;
+
+  try {
+    const snapshot = await db.collection('certificates')
+      .where('studentId', '==', uid)
+      .get();
+
+    const certificates = snapshot.docs.map(doc => {
+      const data = doc.data();
+      let created = null;
+      if (data.createdAt) {
+        created = typeof data.createdAt.toDate === 'function' ? data.createdAt.toDate() : new Date(data.createdAt);
+      }
+      return {
+        id: doc.id,
+        ...data,
+        createdAt: created
+      };
+    }).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+    res.status(200).json({ success: true, certificates });
+  } catch (error) {
+    console.error('Fetch Student Certificates Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching certificates' });
+  }
+});
+
 module.exports = router;
 

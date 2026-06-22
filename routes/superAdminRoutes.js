@@ -632,5 +632,260 @@ router.delete('/typing-paragraphs/:id', verifyToken, requireRole('superadmin'), 
   }
 });
 
+// 22. Get All Student Activity Logs (with User details resolved)
+router.get('/student-activities', verifyToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const activitySnapshot = await db.collection('student_activity')
+      .orderBy('timestamp', 'desc')
+      .limit(1000)
+      .get();
+      
+    // Resolve student user details
+    const studentMap = {};
+    const studentsSnapshot = await db.collection('users').where('role', '==', 'student').get();
+    studentsSnapshot.forEach(doc => {
+      const u = doc.data();
+      studentMap[doc.id] = {
+        name: u.name || 'Unknown Student',
+        email: u.email || 'N/A',
+        rollNumber: u.rollNumber || 'N/A',
+        photoURL: u.photoURL || null
+      };
+    });
+
+    const activities = activitySnapshot.docs.map(doc => {
+      const data = doc.data();
+      const sDetails = studentMap[data.studentId] || {
+        name: 'Unknown Student',
+        email: 'N/A',
+        rollNumber: 'N/A',
+        photoURL: null
+      };
+      let ts = null;
+      if (data.timestamp) {
+        if (typeof data.timestamp.toDate === 'function') {
+          ts = data.timestamp.toDate();
+        } else if (data.timestamp._seconds) {
+          ts = new Date(data.timestamp._seconds * 1000);
+        } else if (data.timestamp.seconds) {
+          ts = new Date(data.timestamp.seconds * 1000);
+        } else {
+          ts = new Date(data.timestamp);
+        }
+      }
+      
+      return {
+        id: doc.id,
+        ...data,
+        timestamp: ts,
+        studentName: sDetails.name,
+        studentEmail: sDetails.email,
+        studentRollNumber: sDetails.rollNumber,
+        studentPhotoURL: sDetails.photoURL
+      };
+    });
+
+    res.status(200).json({ success: true, activities });
+  } catch (error) {
+    console.error('Fetch Student Activities Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching student activities' });
+  }
+});
+
+// 23. Get Specific Student Detailed Activity & Analytics
+router.get('/students/:id/activity-details', verifyToken, requireRole('superadmin'), async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    // 1. Fetch Student User Profile
+    const userDoc = await db.collection('users').doc(id).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Student not found' });
+    }
+    const uData = userDoc.data();
+    
+    // 2. Fetch all student_activity records for this student
+    const activitySnapshot = await db.collection('student_activity')
+      .where('studentId', '==', id)
+      .get();
+      
+    const activities = activitySnapshot.docs.map(doc => {
+      const data = doc.data();
+      let ts = null;
+      if (data.timestamp) {
+        if (typeof data.timestamp.toDate === 'function') {
+          ts = data.timestamp.toDate();
+        } else if (data.timestamp._seconds) {
+          ts = new Date(data.timestamp._seconds * 1000);
+        } else if (data.timestamp.seconds) {
+          ts = new Date(data.timestamp.seconds * 1000);
+        } else {
+          ts = new Date(data.timestamp);
+        }
+      }
+      return {
+        id: doc.id,
+        ...data,
+        timestamp: ts
+      };
+    }).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+
+    // 3. Fetch all test_results for this student
+    const testResultsSnapshot = await db.collection('test_results')
+      .where('studentId', '==', id)
+      .get();
+      
+    // Fetch test details to map names
+    const testsSnapshot = await db.collection('tests').get();
+    const testsMap = {};
+    testsSnapshot.forEach(doc => {
+      testsMap[doc.id] = doc.data().title || 'Untitled Test';
+    });
+
+    const testResults = testResultsSnapshot.docs.map(doc => {
+      const data = doc.data();
+      let subTime = null;
+      if (data.submittedAt) {
+        if (typeof data.submittedAt.toDate === 'function') {
+          subTime = data.submittedAt.toDate();
+        } else if (data.submittedAt._seconds) {
+          subTime = new Date(data.submittedAt._seconds * 1000);
+        } else if (data.submittedAt.seconds) {
+          subTime = new Date(data.submittedAt.seconds * 1000);
+        } else {
+          subTime = new Date(data.submittedAt);
+        }
+      }
+      return {
+        id: doc.id,
+        ...data,
+        submittedAt: subTime,
+        testTitle: testsMap[data.testId] || 'Unknown Test'
+      };
+    }).sort((a, b) => (b.submittedAt || 0) - (a.submittedAt || 0));
+
+    res.status(200).json({
+      success: true,
+      student: {
+        id: userDoc.id,
+        name: uData.name || 'Unknown Student',
+        email: uData.email || 'N/A',
+        rollNumber: uData.rollNumber || 'N/A',
+        photoURL: uData.photoURL || null,
+        lastLogin: uData.lastLogin ? (typeof uData.lastLogin.toDate === 'function' ? uData.lastLogin.toDate() : new Date(uData.lastLogin)) : null,
+        createdAt: uData.createdAt ? (typeof uData.createdAt.toDate === 'function' ? uData.createdAt.toDate() : new Date(uData.createdAt)) : null
+      },
+      activities,
+      testResults
+    });
+
+  } catch (error) {
+    console.error('Fetch Student Activity Details Error:', error);
+    res.status(500).json({ success: false, message: 'Server error retrieving student details' });
+  }
+});
+
+// 24. Upload Student Certificate
+router.post('/students/:studentId/certificates', verifyToken, requireRole('superadmin'), upload.single('file'), async (req, res) => {
+  const { studentId } = req.params;
+  const { title, courseId, courseName, issueDate } = req.body;
+
+  if (!title || !issueDate) {
+    return res.status(400).json({ success: false, message: 'Title and Issue Date are required' });
+  }
+
+  if (!req.file) {
+    return res.status(400).json({ success: false, message: 'Certificate file is required' });
+  }
+
+  try {
+    // 1. Fetch student info
+    const studentDoc = await db.collection('users').doc(studentId).get();
+    if (!studentDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Student not found' });
+    }
+    const studentData = studentDoc.data();
+
+    // 2. Upload to Cloudinary
+    const result = await uploadToCloudinary(req.file.buffer, 'student_certificates', req.file.mimetype);
+    const pdfUrl = result.secure_url;
+
+    // 3. Save to Firestore certificates collection
+    const certData = {
+      studentId,
+      studentName: studentData.name || 'Unknown Student',
+      studentRollNumber: studentData.rollNumber || 'N/A',
+      courseId: courseId || studentData.courseId || null,
+      courseName: courseName || studentData.courseName || null,
+      title,
+      issueDate,
+      pdfUrl,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    const docRef = await db.collection('certificates').add(certData);
+
+    res.status(201).json({
+      success: true,
+      message: 'Certificate uploaded successfully',
+      certificate: { id: docRef.id, ...certData }
+    });
+  } catch (error) {
+    console.error('Upload Student Certificate Error:', error);
+    res.status(500).json({ success: false, message: 'Server error uploading certificate' });
+  }
+});
+
+// 25. Get Student Certificates (Super Admin View)
+router.get('/students/:studentId/certificates', verifyToken, requireRole('superadmin'), async (req, res) => {
+  const { studentId } = req.params;
+
+  try {
+    const snapshot = await db.collection('certificates')
+      .where('studentId', '==', studentId)
+      .get();
+
+    const certificates = snapshot.docs.map(doc => {
+      const data = doc.data();
+      let created = null;
+      if (data.createdAt) {
+        created = typeof data.createdAt.toDate === 'function' ? data.createdAt.toDate() : new Date(data.createdAt);
+      }
+      return {
+        id: doc.id,
+        ...data,
+        createdAt: created
+      };
+    }).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+    res.status(200).json({ success: true, certificates });
+  } catch (error) {
+    console.error('Fetch Student Certificates Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching certificates' });
+  }
+});
+
+// 26. Delete Certificate
+router.delete('/certificates/:certificateId', verifyToken, requireRole('superadmin'), async (req, res) => {
+  const { certificateId } = req.params;
+
+  try {
+    const certRef = db.collection('certificates').doc(certificateId);
+    const certDoc = await certRef.get();
+    if (!certDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Certificate not found' });
+    }
+
+    await certRef.delete();
+
+    res.status(200).json({ success: true, message: 'Certificate deleted successfully' });
+  } catch (error) {
+    console.error('Delete Certificate Error:', error);
+    res.status(500).json({ success: false, message: 'Server error deleting certificate' });
+  }
+});
+
 module.exports = router;
+
+
 

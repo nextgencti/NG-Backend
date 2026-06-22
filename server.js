@@ -117,3 +117,4 @@ const autoLaunchTests = async () => {
 // Run immediately on startup, then every 60 seconds
 autoLaunchTests();
 setInterval(autoLaunchTests, 60 * 1000);
+// Trigger nodemon reload to refresh routes
