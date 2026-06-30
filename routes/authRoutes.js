@@ -1,4 +1,5 @@
 const express = require('express');
+const verifyToken = require('../middleware/authMiddleware');
 const { admin, db, auth } = require('../config/firebase');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
@@ -104,7 +105,7 @@ router.post('/verify-otp', async (req, res) => {
       uid,
       email,
       role: 'student',
-      status: 'pending', // New accounts need admin approval
+      status: 'trial', // New accounts start in Trial Mode
       profileComplete: false,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     };
@@ -175,7 +176,7 @@ router.post('/google-login', async (req, res) => {
       photoURL: picture || null,
       provider: 'google',
       role: 'student',
-      status: 'pending', // New accounts need admin approval
+      status: 'trial', // New accounts start in Trial Mode
       profileComplete: false,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     };
@@ -223,6 +224,81 @@ router.post('/google-login', async (req, res) => {
   }
 });
 
+// 3b. General Firebase Login (supports Email/Password and Google tokens)
+router.post('/firebase-login', async (req, res) => {
+  const { idToken } = req.body;
+
+  if (!idToken) {
+    return res.status(400).json({ success: false, message: 'Firebase ID token required' });
+  }
+
+  try {
+    // Verify the Firebase ID token from the client
+    const decodedToken = await auth.verifyIdToken(idToken);
+    const { uid, email, name, picture } = decodedToken;
+
+    // Check Firestore for existing user profile
+    const userDocRef = db.collection('users').doc(uid);
+    const userDoc = await userDocRef.get();
+    
+    let isNewUser = false;
+    let userData;
+
+    if (!userDoc.exists) {
+      userData = {
+        uid,
+        email,
+        name: name || '',
+        photoURL: picture || null,
+        provider: decodedToken.firebase?.sign_in_provider || 'password',
+        role: 'student',
+        status: 'trial', // New accounts start in Trial Mode
+        profileComplete: false,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      };
+      // Create new Firestore document for the user
+      await userDocRef.set(userData);
+      isNewUser = true;
+    } else {
+      userData = userDoc.data();
+      // Update lastLogin and photo
+      const updates = { lastLogin: admin.firestore.FieldValue.serverTimestamp() };
+      if (!userData.photoURL && picture) updates.photoURL = picture;
+      await userDocRef.update(updates);
+      userData.lastLogin = new Date();
+      if (!userData.photoURL && picture) userData.photoURL = picture;
+    }
+
+    // Fetch Institute Name if instituteId exists
+    if (userData.instituteId) {
+      try {
+        const instDoc = await db.collection('institutes').doc(userData.instituteId).get();
+        if (instDoc.exists) {
+          userData.instituteName = instDoc.data().name;
+          userData.instituteLogoURL = instDoc.data().logoURL;
+        }
+      } catch (err) {
+        console.warn('Failed to fetch institute name:', err.message);
+      }
+    }
+
+    // Generate session JWT
+    const token = generateToken(uid, userData.role, userData.instituteId);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Login successful',
+      token,
+      user: userData,
+      isNewUser
+    });
+
+  } catch (error) {
+    console.error('Firebase Login Verification Error:', error);
+    res.status(401).json({ success: false, message: 'Unauthorized / Invalid Firebase Token' });
+  }
+});
+
 // 4. Register Institute Request
 router.post('/register-institute', async (req, res) => {
   try {
@@ -257,6 +333,29 @@ router.post('/register-institute', async (req, res) => {
   } catch (error) {
     console.error('Register Institute Error:', error);
     res.status(500).json({ success: false, message: 'Server error submitting request' });
+  }
+});
+
+// 5. Update Password (after verifying email via OTP/login)
+router.post('/update-password', verifyToken, async (req, res) => {
+  const { uid } = req.user;
+  const { password } = req.body;
+
+  if (!password || password.length < 6) {
+    return res.status(400).json({ success: false, message: 'Password must be at least 6 characters long' });
+  }
+
+  try {
+    // Update Firebase Auth password
+    await auth.updateUser(uid, { password: password });
+    
+    return res.status(200).json({
+      success: true,
+      message: 'Password updated successfully'
+    });
+  } catch (error) {
+    console.error('Update Password Error:', error);
+    res.status(500).json({ success: false, message: 'Failed to update password' });
   }
 });
 

@@ -526,7 +526,7 @@ const studyThrottleMap = new Map();
 
 router.post('/track-study', verifyToken, async (req, res) => {
   const { uid } = req.user;
-  const { type, referenceId, label, duration } = req.body;
+  const { type, referenceId, label, duration, lessonId } = req.body;
 
   if (!type || !referenceId) {
     return res.status(400).json({ success: false, message: 'type and referenceId are required' });
@@ -534,7 +534,7 @@ router.post('/track-study', verifyToken, async (req, res) => {
 
   try {
     // Throttle: Prevent duplicate heartbeats within 50 seconds (in-memory)
-    const throttleKey = `${uid}_${type}_${referenceId}`;
+    const throttleKey = `${uid}_${type}_${referenceId}_${lessonId || ''}`;
     const now = Date.now();
     const lastTime = studyThrottleMap.get(throttleKey) || 0;
     
@@ -548,10 +548,40 @@ router.post('/track-study', verifyToken, async (req, res) => {
       studentId: uid,
       type: `study_${type}`,       // 'study_classroom' or 'study_test'
       referenceId: referenceId,     // courseId or testId
+      lessonId: lessonId || null,
       action: label ? `Studying: ${label}` : `Active on ${type} page`,
       duration: duration || 1,      // minutes (default 1 minute per heartbeat)
       timestamp: new Date()
     });
+
+    // Save lesson duration to student progress
+    if (type === 'classroom' && lessonId) {
+      const progressSnapshot = await db.collection('student_progress')
+        .where('studentId', '==', uid)
+        .where('courseId', '==', referenceId)
+        .limit(1)
+        .get();
+
+      let progressDocRef;
+      let lessonTimeSpent = {};
+
+      if (progressSnapshot.empty) {
+        progressDocRef = db.collection('student_progress').doc();
+      } else {
+        progressDocRef = progressSnapshot.docs[0].ref;
+        lessonTimeSpent = progressSnapshot.docs[0].data().lessonTimeSpent || {};
+      }
+
+      const currentMinutes = lessonTimeSpent[lessonId] || 0;
+      lessonTimeSpent[lessonId] = currentMinutes + (duration || 1);
+
+      await progressDocRef.set({
+        studentId: uid,
+        courseId: referenceId,
+        lessonTimeSpent: lessonTimeSpent,
+        updatedAt: new Date()
+      }, { merge: true });
+    }
 
     res.status(200).json({ success: true, message: 'Study time tracked' });
   } catch (error) {
@@ -842,8 +872,10 @@ router.get('/courses/:courseId/classroom', verifyToken, async (req, res) => {
       .get();
 
     let completedLessons = [];
+    let lessonTimeSpent = {};
     if (!progressSnapshot.empty) {
       completedLessons = progressSnapshot.docs[0].data().completedLessons || [];
+      lessonTimeSpent = progressSnapshot.docs[0].data().lessonTimeSpent || {};
     }
 
     // 3. Calculate total lessons and progress percentage
@@ -866,6 +898,7 @@ router.get('/courses/:courseId/classroom', verifyToken, async (req, res) => {
       },
       curriculum,
       completedLessons,
+      lessonTimeSpent,
       progressPercentage,
       totalLessons
     });
@@ -911,17 +944,31 @@ router.post('/courses/:courseId/lessons/:lessonId/complete', verifyToken, async 
 
     let completedLessons = [];
     let progressDocRef;
+    let lessonTimeSpent = {};
 
     if (progressSnapshot.empty) {
       // Create new progress document
       progressDocRef = db.collection('student_progress').doc();
       completedLessons = [];
+      lessonTimeSpent = {};
     } else {
       progressDocRef = progressSnapshot.docs[0].ref;
-      completedLessons = progressSnapshot.docs[0].data().completedLessons || [];
+      const progressData = progressSnapshot.docs[0].data();
+      completedLessons = progressData.completedLessons || [];
+      lessonTimeSpent = progressData.lessonTimeSpent || {};
     }
 
-    // 3. Check if already completed
+    // 3. Enforce 10 minutes check (REQUIRED_MINUTES = 10)
+    const REQUIRED_MINUTES = 10;
+    const minutesSpent = lessonTimeSpent[lessonId] || 0;
+    if (minutesSpent < REQUIRED_MINUTES) {
+      return res.status(400).json({
+        success: false,
+        message: `You must spend at least ${REQUIRED_MINUTES} minutes on this lesson. Currently spent: ${minutesSpent} minute(s).`
+      });
+    }
+
+    // 4. Check if already completed
     if (completedLessons.includes(lessonId)) {
       return res.status(200).json({
         success: true,
@@ -931,7 +978,7 @@ router.post('/courses/:courseId/lessons/:lessonId/complete', verifyToken, async 
       });
     }
 
-    // 4. Sequential unlock validation — previous lesson must be completed (except first)
+    // 5. Sequential unlock validation — previous lesson must be completed (except first)
     if (lessonIndex > 0) {
       const previousLessonId = allLessonIds[lessonIndex - 1];
       if (!completedLessons.includes(previousLessonId)) {
@@ -1420,6 +1467,156 @@ router.get('/certificates', verifyToken, async (req, res) => {
   } catch (error) {
     console.error('Fetch Student Certificates Error:', error);
     res.status(500).json({ success: false, message: 'Server error fetching certificates' });
+  }
+});
+
+// Update student profile details (admission details completion)
+router.put('/profile', verifyToken, async (req, res) => {
+  const { uid } = req.user;
+  const { 
+    name, 
+    phone, 
+    fatherName, 
+    motherName, 
+    dob, 
+    gender, 
+    aadhaar, 
+    address, 
+    photoURL 
+  } = req.body;
+
+  try {
+    const userRef = db.collection('users').doc(uid);
+    const userDoc = await userRef.get();
+
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    // Validate inputs
+    if (phone && phone.length !== 10) {
+      return res.status(400).json({ success: false, message: 'Phone number must be exactly 10 digits' });
+    }
+    if (aadhaar && aadhaar.length !== 12) {
+      return res.status(400).json({ success: false, message: 'Aadhaar number must be exactly 12 digits' });
+    }
+
+    const updates = {
+      name: name || userDoc.data().name || '',
+      phone: phone || userDoc.data().phone || '',
+      fatherName: fatherName || '',
+      motherName: motherName || '',
+      dob: dob || '2000-01-01',
+      gender: gender || '',
+      aadhaar: aadhaar || '',
+      address: address || '',
+      updatedAt: new Date()
+    };
+
+    if (photoURL) {
+      updates.photoURL = photoURL;
+    }
+
+    await userRef.update(updates);
+
+    // Fetch updated user data
+    const updatedDoc = await userRef.get();
+    const updatedData = updatedDoc.data();
+
+    // Fetch Institute Name
+    if (updatedData.instituteId) {
+      const instDoc = await db.collection('institutes').doc(updatedData.instituteId).get();
+      if (instDoc.exists) {
+        updatedData.instituteName = instDoc.data().name;
+      }
+    }
+
+    res.status(200).json({ 
+      success: true, 
+      message: 'Profile updated successfully!', 
+      user: updatedData 
+    });
+  } catch (error) {
+    console.error('Update Profile Error:', error);
+    res.status(500).json({ success: false, message: 'Server error updating profile' });
+  }
+});
+
+// POST /api/student/ask-sanju
+router.post('/ask-sanju', verifyToken, async (req, res) => {
+  try {
+    const { message, history } = req.body;
+    if (!message) {
+      return res.status(400).json({ success: false, message: 'Message is required' });
+    }
+
+    const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+    if (!GEMINI_API_KEY) {
+      return res.status(500).json({ success: false, message: 'AI Tutor service is not configured' });
+    }
+
+    const axios = require('axios');
+    
+    // Construct Gemini contents array
+    const contents = [];
+    if (Array.isArray(history)) {
+      // Filter to limit to last 10 messages to keep request payload compact and clean
+      const recentHistory = history.slice(-10);
+      recentHistory.forEach(item => {
+        contents.push({
+          role: item.role === 'model' ? 'model' : 'user',
+          parts: [{ text: item.text }]
+        });
+      });
+    }
+    
+    // Add current user message
+    contents.push({
+      role: 'user',
+      parts: [{ text: message }]
+    });
+
+    const systemInstruction = {
+      parts: [{ 
+        text: "आपका नाम Sanju है। आप NextGen Computer Training Institute (Muskara) के एक बहुत ही मिलनसार, बुद्धिमान और सहायक AI Tutor हैं। जब भी कोई छात्र आपसे बात शुरू करे, तो हमेशा उनका स्वागत (Greet) करें, अपना नाम 'Sanju' बताएं, और उनके डाउट्स को बहुत ही आसान हिंदी/Hinglish भाषा में समझाएं। अपने जवाबों को छोटा, पॉइंट-टू-पॉइंट, रोचक और आसानी से समझ आने वाला रखें। कोडिंग या कंप्यूटर के कठिन विषयों को रोज़मर्रा के उदाहरणों से समझाएं। यदि कोई छात्र कंप्यूटर कोर्स या कोडिंग के बाहर का सवाल पूछता है (जैसे राजनीती, खेल, सामान्य गपशप), तो उन्हें प्यार से कहें कि आप केवल कंप्यूटर और उनके कोर्स से जुड़े सवालों में ही उनकी मदद कर सकते हैं।" 
+      }]
+    };
+
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        contents,
+        systemInstruction
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    let reply = "माफ़ी चाहता हूँ, मैं इस समय उत्तर देने में असमर्थ हूँ। कृपया दोबारा प्रयास करें।";
+    let audio = null;
+
+    const parts = response.data?.candidates?.[0]?.content?.parts;
+    if (Array.isArray(parts)) {
+      parts.forEach(part => {
+        if (part.text) {
+          reply = part.text;
+        } else if (part.inlineData && part.inlineData.data) {
+          audio = part.inlineData.data; // Base64 audio stream
+        }
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      reply,
+      audio
+    });
+  } catch (error) {
+    console.error('Ask Sanju AI Tutor Error:', error?.response?.data || error.message);
+    res.status(500).json({ success: false, message: 'Failed to get response from AI tutor' });
   }
 });
 

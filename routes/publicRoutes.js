@@ -397,6 +397,21 @@ router.get('/gov-services', async (req, res) => {
   }
 });
 
+// 8.5 Get a single public government service detail
+router.get('/gov-services/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const doc = await db.collection('gov_services').doc(id).get();
+    if (!doc.exists) {
+      return res.status(404).json({ success: false, message: 'Government service not found' });
+    }
+    res.status(200).json({ success: true, service: { id: doc.id, ...doc.data() } });
+  } catch (error) {
+    console.error('Public Fetch Gov Service Detail Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching government service details' });
+  }
+});
+
 // 9. Get all typing paragraphs
 router.get('/typing-paragraphs', async (req, res) => {
   try {
@@ -407,6 +422,11 @@ router.get('/typing-paragraphs', async (req, res) => {
     console.error('Public Fetch Typing Paragraphs Error:', error);
     res.status(500).json({ success: false, message: 'Server error fetching typing paragraphs' });
   }
+});
+
+// 10. Simple health check endpoint to check server availability
+router.get('/health-check', (req, res) => {
+  res.status(200).json({ success: true, message: 'Server is reachable' });
 });
 
 module.exports = router;

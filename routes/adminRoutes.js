@@ -97,7 +97,7 @@ router.put('/students/:id/status', verifyToken, requireRole('admin'), async (req
   const { id } = req.params;
   const { status } = req.body; // e.g., 'active', 'rejected', 'inactive'
 
-  if (!['active', 'rejected', 'pending', 'inactive'].includes(status)) {
+  if (!['active', 'rejected', 'pending', 'inactive', 'trial'].includes(status)) {
     return res.status(400).json({ success: false, message: 'Invalid status value' });
   }
 
@@ -563,7 +563,12 @@ router.post('/upload-content-image', verifyToken, requireRole('admin'), upload.a
 // 5. Add New Student
 router.post('/students', verifyToken, requireRole('admin'), upload.single('profilePic'), async (req, res) => {
   try {
-    const { name, email, courseId, phone, address } = req.body;
+    const { 
+      name, email, courseId, phone, address,
+      fatherName, motherName, dob, gender, aadhaar,
+      batchTiming, admissionDate, totalFee, feePaid, paymentMode,
+      admissionTakenBy, password
+    } = req.body;
     let photoURL = null;
 
     if (!name || !email) {
@@ -583,6 +588,7 @@ router.post('/students', verifyToken, requireRole('admin'), upload.single('profi
       if (authError.code === 'auth/user-not-found') {
         userRecord = await auth.createUser({
           email: email,
+          password: password || 'NextGen@123',
           displayName: name,
           emailVerified: true
         });
@@ -594,12 +600,13 @@ router.post('/students', verifyToken, requireRole('admin'), upload.single('profi
     const { uid } = userRecord;
 
     // 2. Save in Firestore
-    // 3. Assign Roll Number
+    // 3. Assign Roll Number and Receipt Number
     let rollNumber = null;
+    let receiptNumber = null;
     await db.runTransaction(async (transaction) => {
+      // Roll Number
       const counterRef = db.collection('counters').doc('students');
       const counterDoc = await transaction.get(counterRef);
-      
       let nextCount = 1;
       if (!counterDoc.exists) {
         transaction.set(counterRef, { count: 1 });
@@ -610,6 +617,18 @@ router.post('/students', verifyToken, requireRole('admin'), upload.single('profi
 
       const year = new Date().getFullYear();
       rollNumber = `NG-${year}-${String(nextCount).padStart(3, '0')}`;
+
+      // Receipt Number
+      const receiptCounterRef = db.collection('counters').doc('receipts');
+      const receiptCounterDoc = await transaction.get(receiptCounterRef);
+      let nextReceiptCount = 1;
+      if (!receiptCounterDoc.exists) {
+        transaction.set(receiptCounterRef, { count: 1 });
+      } else {
+        nextReceiptCount = receiptCounterDoc.data().count + 1;
+        transaction.update(receiptCounterRef, { count: nextReceiptCount });
+      }
+      receiptNumber = `REC-${year}-${String(nextReceiptCount).padStart(4, '0')}`;
     });
 
     const userData = {
@@ -625,7 +644,20 @@ router.post('/students', verifyToken, requireRole('admin'), upload.single('profi
       photoURL,
       status: 'active',
       rollNumber,
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      fatherName: fatherName || null,
+      motherName: motherName || null,
+      dob: dob || null,
+      gender: gender || null,
+      aadhaar: aadhaar || null,
+      batchTiming: batchTiming || null,
+      admissionDate: admissionDate || null,
+      totalFee: totalFee || null,
+      feePaid: feePaid || null,
+      paymentMode: paymentMode || null,
+      admissionTakenBy: admissionTakenBy || null,
+      receiptNumber: receiptNumber,
+      password: password || null
     };
 
     if (req.user.role === 'admin' && req.user.instituteId) {
@@ -670,6 +702,128 @@ router.post('/students', verifyToken, requireRole('admin'), upload.single('profi
   } catch (error) {
     console.error('Add Student Error:', error);
     res.status(500).json({ success: false, message: 'Server error adding student' });
+  }
+});
+
+// 5b. Edit Student Details
+router.put('/students/:id', verifyToken, requireRole(['superadmin', 'admin']), upload.single('profilePic'), async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { 
+      name, courseId, phone, address,
+      fatherName, motherName, dob, gender, aadhaar,
+      batchTiming, admissionDate, totalFee, feePaid, paymentMode,
+      payment
+    } = req.body;
+
+    const studentRef = db.collection('users').doc(id);
+    const studentDoc = await studentRef.get();
+    if (!studentDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Student not found' });
+    }
+
+    let photoURL = studentDoc.data().photoURL || null;
+
+    if (req.file) {
+      const result = await uploadToCloudinary(req.file.buffer, 'nextgen_profiles');
+      photoURL = result.secure_url;
+    }
+
+    const previousCourseId = studentDoc.data().courseId || studentDoc.data().course || null;
+
+    const updateData = {
+      photoURL,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    if (name) {
+      updateData.name = name;
+      updateData.fullName = name;
+      await auth.updateUser(id, { displayName: name });
+    }
+    if (courseId !== undefined) {
+      updateData.courseId = courseId || null;
+      updateData.course = courseId || null;
+    }
+    if (phone !== undefined) updateData.phone = phone || null;
+    if (address !== undefined) updateData.address = address || null;
+    if (fatherName !== undefined) updateData.fatherName = fatherName || null;
+    if (motherName !== undefined) updateData.motherName = motherName || null;
+    if (dob !== undefined) updateData.dob = dob || null;
+    if (gender !== undefined) updateData.gender = gender || null;
+    if (aadhaar !== undefined) updateData.aadhaar = aadhaar || null;
+    if (batchTiming !== undefined) updateData.batchTiming = batchTiming || null;
+    if (admissionDate !== undefined) updateData.admissionDate = admissionDate || null;
+    if (totalFee !== undefined) updateData.totalFee = totalFee || null;
+    if (feePaid !== undefined) updateData.feePaid = feePaid || null;
+    if (paymentMode !== undefined) updateData.paymentMode = paymentMode || null;
+    if (payment !== undefined) updateData.payment = payment || null;
+
+    await studentRef.update(updateData);
+
+    // Update course enrollments counts if course changed
+    if (courseId !== undefined && courseId !== previousCourseId) {
+      if (previousCourseId) {
+        const prevCourseRef = db.collection('courses').doc(previousCourseId);
+        const prevCourseDoc = await prevCourseRef.get();
+        if (prevCourseDoc.exists) {
+          const currentCount = prevCourseDoc.data().students || 0;
+          await prevCourseRef.update({
+            students: Math.max(0, currentCount - 1)
+          });
+        }
+      }
+
+      if (courseId) {
+        const newCourseRef = db.collection('courses').doc(courseId);
+        const newCourseDoc = await newCourseRef.get();
+        if (newCourseDoc.exists) {
+          const currentCount = newCourseDoc.data().students || 0;
+          await newCourseRef.update({
+            students: currentCount + 1
+          });
+        }
+
+        const enrollSnapshot = await db.collection('enrollments')
+          .where('studentId', '==', id)
+          .where('courseId', '==', previousCourseId)
+          .limit(1)
+          .get();
+
+        if (!enrollSnapshot.empty) {
+          await enrollSnapshot.docs[0].ref.update({
+            courseId: courseId,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+        } else {
+          const enrollmentData = {
+            studentId: id,
+            courseId: courseId,
+            enrolledAt: admin.firestore.FieldValue.serverTimestamp(),
+            status: 'active'
+          };
+          if (req.user.role === 'admin' && req.user.instituteId) {
+            enrollmentData.instituteId = req.user.instituteId;
+          } else if (req.user.role === 'superadmin' && req.body.instituteId) {
+            enrollmentData.instituteId = req.body.instituteId;
+          }
+          await db.collection('enrollments').add(enrollmentData);
+        }
+      }
+    }
+
+    const updatedStudentDoc = await studentRef.get();
+    const updatedStudentData = { id, ...updatedStudentDoc.data() };
+
+    res.status(200).json({ 
+      success: true, 
+      message: 'Student updated successfully',
+      student: updatedStudentData
+    });
+
+  } catch (error) {
+    console.error('Edit Student Error:', error);
+    res.status(500).json({ success: false, message: 'Server error updating student' });
   }
 });
 
@@ -873,14 +1027,53 @@ router.get('/tests', verifyToken, requireRole('admin'), async (req, res) => {
 });
 
 // 7a. Get Full Test Details (Including Questions and Answers)
-router.get('/tests/:testId/full', verifyToken, requireRole('admin'), async (req, res) => {
+router.get('/tests/:testId/full', verifyToken, requireRole(['admin', 'superadmin', 'student']), async (req, res) => {
   try {
     const { testId } = req.params;
     
+    // Enforce once-per-day viewing limit for students
+    if (req.user.role === 'student') {
+      const studentId = req.user.uid;
+      const todayStr = new Date().toISOString().split('T')[0]; // "YYYY-MM-DD"
+      
+      const viewRef = db.collection('presentation_views')
+        .where('studentId', '==', studentId)
+        .where('testId', '==', testId)
+        .where('date', '==', todayStr);
+      
+      const viewSnap = await viewRef.get();
+      if (!viewSnap.empty) {
+        // Check if the most recent view was within the last 2 minutes
+        // to handle React strict mode double-firing or quick page refreshes gracefully
+        const docs = viewSnap.docs.map(doc => doc.data());
+        const recentView = docs.find(d => {
+          const viewedAt = d.viewedAt ? (typeof d.viewedAt.toDate === 'function' ? d.viewedAt.toDate() : new Date(d.viewedAt)) : null;
+          if (!viewedAt) return false;
+          const diffMs = new Date() - viewedAt;
+          return diffMs < 120000; // 2 minutes grace period
+        });
+
+        if (!recentView) {
+          return res.status(403).json({ 
+            success: false, 
+            message: 'आप इस टेस्ट की प्रेजेंटेशन आज देख चुके हैं। छात्रों के लिए प्रतिदिन केवल एक बार देखने की सीमा है।' 
+          });
+        }
+      } else {
+        // Record this view
+        await db.collection('presentation_views').add({
+          studentId,
+          testId,
+          date: todayStr,
+          viewedAt: new Date()
+        });
+      }
+    }
+
     const testDoc = await db.collection('tests').doc(testId).get();
     if (!testDoc.exists) return res.status(404).json({ success: false, message: 'Test not found' });
     
-    // Fetch questions with correct answers for Admin
+    // Fetch questions with correct answers
     const qSnapshot = await db.collection('tests').doc(testId).collection('questions').get();
     const questions = qSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 
@@ -1724,6 +1917,68 @@ router.get('/finance/transactions', verifyToken, requireRole('admin'), async (re
   } catch (error) {
     console.error('Fetch Transactions Error:', error);
     res.status(500).json({ success: false, message: 'Server error retrieving transaction logs' });
+  }
+});
+
+// POST /api/admin/explain-question
+router.post('/explain-question', verifyToken, requireRole(['admin', 'superadmin', 'student']), async (req, res) => {
+  try {
+    const { question, options, correctAnswer } = req.body;
+    if (!question || !correctAnswer) {
+      return res.status(400).json({ success: false, message: 'Question and correctAnswer are required' });
+    }
+
+    const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+    if (!GEMINI_API_KEY) {
+      return res.status(500).json({ success: false, message: 'AI Explanation service is not configured' });
+    }
+
+    const axios = require('axios');
+    
+    // Construct message prompt
+    let message = `Question: ${question}\n`;
+    if (options) {
+      message += `Options:\n`;
+      if (options.A) message += `A. ${options.A}\n`;
+      if (options.B) message += `B. ${options.B}\n`;
+      if (options.C) message += `C. ${options.C}\n`;
+      if (options.D) message += `D. ${options.D}\n`;
+    }
+    message += `Correct Answer: ${correctAnswer}\n\nExplain in easy Hindi/Hinglish (3-4 sentences max) why this option is correct. Be very concise and do not include introductions.`;
+
+    const contents = [{
+      role: 'user',
+      parts: [{ text: message }]
+    }];
+
+    const systemInstruction = {
+      parts: [{ 
+        text: "आप NextGen Computer Training Institute (Muskara) के AI Tutor 'Sanju' हैं। आपका काम शिक्षकों/छात्रों को एक बहुविकल्पीय प्रश्न (MCQ) का सही उत्तर और उसका स्पष्टीकरण बहुत ही आसान हिंदी/Hinglish भाषा में समझाना है। जवाब को संक्षिप्त (Short), पॉइंट-टू-पॉइंट और 3-4 वाक्यों में रखें। तकनीकी शब्दों को स्पष्ट करें।" 
+      }]
+    };
+
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        contents,
+        systemInstruction
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    let explanation = "माफ़ी चाहता हूँ, मैं इस समय स्पष्टीकरण देने में असमर्थ हूँ।";
+    if (response.data?.candidates?.[0]?.content?.parts?.[0]?.text) {
+      explanation = response.data.candidates[0].content.parts[0].text;
+    }
+
+    res.status(200).json({ success: true, explanation });
+  } catch (error) {
+    console.error('Explain Question Error:', error);
+    res.status(500).json({ success: false, message: 'Server error explaining question' });
   }
 });
 
