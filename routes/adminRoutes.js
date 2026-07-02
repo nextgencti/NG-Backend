@@ -1982,6 +1982,170 @@ router.post('/explain-question', verifyToken, requireRole(['admin', 'superadmin'
   }
 });
 
+// POST /api/admin/chat-ai
+router.post('/chat-ai', verifyToken, requireRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const { prompt, history } = req.body;
+    if (!prompt) {
+      return res.status(400).json({ success: false, message: 'Prompt is required' });
+    }
+
+    const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+    if (!GEMINI_API_KEY) {
+      return res.status(500).json({ success: false, message: 'AI Chat service is not configured' });
+    }
+
+    const axios = require('axios');
+    
+    // Construct message history and format for Gemini API format
+    let contents = [];
+    if (history && Array.isArray(history)) {
+      contents = history.map(item => ({
+        role: item.role === 'user' ? 'user' : 'model',
+        parts: [{ text: item.parts?.[0]?.text || item.content || '' }]
+      }));
+    }
+    
+    // Append current user prompt
+    contents.push({
+      role: 'user',
+      parts: [{ text: prompt }]
+    });
+
+    const systemInstruction = {
+      parts: [{ 
+        text: "आप NextGen Computer Training Institute (Muskara) के AI Tutor 'Sanju' हैं। आपका काम शिक्षकों को कंप्यूटर टॉपिक्स (जैसे Web Development, Office, Tally आदि) पर बहुत ही सुंदर, व्यवस्थित, और स्पष्ट नोट्स बनाने में मदद करना है। नियम: 1. जवाब में कोई भी ग्रीटिंग (जैसे: 'नमस्ते', 'हेलो', 'प्रिय शिक्षक') या बातचीत शुरू/खत्म करने वाले वाक्य (जैसे: 'क्या आप चाहते हैं कि...', 'मुझे बताएं!') बिल्कुल न लिखें। 2. सीधे नोट्स का शीर्षक (Title), मुख्य बिंदु (Bullet Points) और उदाहरण देना शुरू करें। 3. नोट्स को बहुत ही सुंदर, स्पष्ट और पेशेवर बनाने के लिए हेडिंग्स, टेबल्स, बुलेट पॉइंट्स और कोड ब्लॉक्स का उपयुक्त उपयोग करें।" 
+      }]
+    };
+
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        contents,
+        systemInstruction
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    let reply = "माफ़ी चाहता हूँ, मैं इस समय उत्तर देने में असमर्थ हूँ।";
+    if (response.data?.candidates?.[0]?.content?.parts?.[0]?.text) {
+      reply = response.data.candidates[0].content.parts[0].text;
+    }
+
+    res.status(200).json({ success: true, reply });
+  } catch (error) {
+    console.error('AI Chat Error:', error);
+    res.status(500).json({ success: false, message: 'Server error processing AI chat request' });
+  }
+});
+
+// POST /api/admin/generate-questions
+router.post('/generate-questions', verifyToken, requireRole(['admin', 'superadmin']), async (req, res) => {
+  try {
+    const { topic, count } = req.body;
+    if (!topic) {
+      return res.status(400).json({ success: false, message: 'Topic is required' });
+    }
+    const targetCount = parseInt(count) || 5;
+    const finalCount = Math.min(100, Math.max(1, targetCount));
+
+    const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+    if (!GEMINI_API_KEY) {
+      return res.status(500).json({ success: false, message: 'AI test generation service is not configured' });
+    }
+
+    const axios = require('axios');
+
+    // Split targetCount into chunks of maximum 10 questions to avoid Gemini output token truncation limits
+    const chunks = [];
+    let remaining = finalCount;
+    while (remaining > 0) {
+      const chunkSize = Math.min(10, remaining);
+      chunks.push(chunkSize);
+      remaining -= chunkSize;
+    }
+
+    let allQuestions = [];
+
+    for (let chunkIdx = 0; chunkIdx < chunks.length; chunkIdx++) {
+      const chunkSize = chunks[chunkIdx];
+      const existingTitles = allQuestions.map(q => q.question).slice(-30);
+      const duplicatesPrompt = existingTitles.length > 0
+        ? `\nCRITICAL: Do NOT generate any questions similar or identical to the following already generated questions:\n${JSON.stringify(existingTitles)}`
+        : "";
+
+      const prompt = `Generate exactly ${chunkSize} multiple-choice questions (MCQs) on the topic: "${topic}".
+Each question must have exactly 4 options (A, B, C, D), a single correctAnswer (must be exactly 'A', 'B', 'C', or 'D'), and a default "marks" of 1.
+The language of the questions and options should be simple English or Hinglish suitable for computer course students.${duplicatesPrompt}
+You MUST output ONLY a valid JSON array of objects without any backticks, markdown formatting, or preamble. 
+
+JSON structure example:
+[
+  {
+    "question": "Question text here?",
+    "options": {
+      "A": "Option A text",
+      "B": "Option B text",
+      "C": "Option C text",
+      "D": "Option D text"
+    },
+    "correctAnswer": "A",
+    "marks": 1
+  }
+]`;
+
+      const contents = [{
+        role: 'user',
+        parts: [{ text: prompt }]
+      }];
+
+      const response = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          contents,
+          generationConfig: {
+            responseMimeType: "application/json"
+          }
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      let generatedText = "";
+      if (response.data?.candidates?.[0]?.content?.parts?.[0]?.text) {
+        generatedText = response.data.candidates[0].content.parts[0].text;
+      }
+
+      let chunkQuestions = [];
+      try {
+        chunkQuestions = JSON.parse(generatedText);
+      } catch (parseErr) {
+        console.error("Gemini JSON Chunk Parsing Error:", parseErr, generatedText);
+        const match = generatedText.match(/\[\s*\{[\s\S]*\}\s*\]/);
+        if (match) {
+          chunkQuestions = JSON.parse(match[0]);
+        }
+      }
+
+      if (Array.isArray(chunkQuestions)) {
+        allQuestions = allQuestions.concat(chunkQuestions);
+      }
+    }
+
+    res.status(200).json({ success: true, questions: allQuestions });
+  } catch (error) {
+    console.error('Generate Questions Error:', error);
+    res.status(500).json({ success: false, message: 'Server error generating questions' });
+  }
+});
+
 module.exports = router;
 
 
