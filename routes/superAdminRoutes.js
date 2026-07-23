@@ -219,7 +219,7 @@ router.get('/stats', verifyToken, requireRole('superadmin'), async (req, res) =>
 
       const netFee = Math.max(0, baseFee - discountAmount);
       let totalStudentFee = 0;
-      const studentPaidAmount = Number(student.paidAmount) || 0;
+      const studentPaidAmount = Number(student.paidAmount !== undefined && student.paidAmount !== null ? student.paidAmount : (student.feePaid || 0)) || 0;
 
       if (feeType === 'monthly') {
         const durationMonths = getEnrolledMonthsHelper(student.createdAt, course.duration, 'monthly');
@@ -465,6 +465,19 @@ router.patch('/tests/:testId/leaderboard-settings', verifyToken, requireRole('su
     const { testId } = req.params;
     const { autoResetDuration } = req.body; // 'daily', 'weekly', 'monthly', 'never'
 
+    if (testId === 'all') {
+      const snapshot = await db.collection('tests').where('isPublic', '==', true).get();
+      const batch = db.batch();
+      snapshot.docs.forEach(doc => {
+        batch.update(doc.ref, {
+          leaderboardResetDuration: autoResetDuration || 'never',
+          lastLeaderboardReset: admin.firestore.FieldValue.serverTimestamp()
+        });
+      });
+      await batch.commit();
+      return res.status(200).json({ success: true, message: 'Auto-reset settings updated for all public tests' });
+    }
+
     await db.collection('tests').doc(testId).update({
       leaderboardResetDuration: autoResetDuration || 'never',
       lastLeaderboardReset: admin.firestore.FieldValue.serverTimestamp()
@@ -483,6 +496,43 @@ router.post('/tests/:testId/reset-leaderboard', verifyToken, requireRole('supera
     const { testId } = req.params;
     console.log(`[SuperAdmin] Resetting leaderboard for testId: ${testId}`);
 
+    if (testId === 'all') {
+      const snapshot = await db.collection('public_test_results').get();
+      console.log(`[SuperAdmin] Resetting ALL public test results (${snapshot.size} records)`);
+
+      if (snapshot.empty) {
+        return res.status(200).json({ 
+          success: true, 
+          message: 'No records found. Leaderboard is already clean.',
+          count: 0 
+        });
+      }
+
+      // Delete in batches of 500
+      const docs = snapshot.docs;
+      for (let i = 0; i < docs.length; i += 500) {
+        const chunk = docs.slice(i, i + 500);
+        const batch = db.batch();
+        chunk.forEach(doc => batch.delete(doc.ref));
+        await batch.commit();
+      }
+
+      // Update timestamp on all public tests
+      const publicTests = await db.collection('tests').where('isPublic', '==', true).get();
+      const testBatch = db.batch();
+      publicTests.docs.forEach(doc => {
+        testBatch.update(doc.ref, {
+          lastLeaderboardReset: admin.firestore.FieldValue.serverTimestamp()
+        });
+      });
+      await testBatch.commit();
+
+      return res.status(200).json({ 
+        success: true, 
+        message: `Leaderboard for ALL public tests reset successfully (${snapshot.size} records removed).` 
+      });
+    }
+
     const snapshot = await db.collection('public_test_results')
       .where('testId', '==', testId)
       .get();
@@ -490,7 +540,6 @@ router.post('/tests/:testId/reset-leaderboard', verifyToken, requireRole('supera
     console.log(`[SuperAdmin] Found ${snapshot.size} records matching testId: ${testId}`);
 
     if (snapshot.empty) {
-      // Still return success but with a specific message
       return res.status(200).json({ 
         success: true, 
         message: 'No records found for this test. Leaderboard is already clean.',
@@ -498,12 +547,14 @@ router.post('/tests/:testId/reset-leaderboard', verifyToken, requireRole('supera
       });
     }
 
-    // Delete in batches
-    const batch = db.batch();
-    snapshot.docs.forEach(doc => {
-      batch.delete(doc.ref);
-    });
-    await batch.commit();
+    // Delete in batches of 500
+    const docs = snapshot.docs;
+    for (let i = 0; i < docs.length; i += 500) {
+      const chunk = docs.slice(i, i + 500);
+      const batch = db.batch();
+      chunk.forEach(doc => batch.delete(doc.ref));
+      await batch.commit();
+    }
 
     // Update last reset timestamp
     await db.collection('tests').doc(testId).update({

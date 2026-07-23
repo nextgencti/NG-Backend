@@ -770,27 +770,38 @@ router.get('/tests', verifyToken, async (req, res) => {
       ...doc.data()
     })).filter(test => {
       const testCourseName = (test.course || '').trim().toLowerCase();
-      if (!testCourseName) return false;
+      if (!testCourseName && (!test.courses || test.courses.length === 0) && (!test.courseIds || test.courseIds.length === 0)) return false;
 
       // Check if test course name matches any of the student's enrolled course names loosely
       const matchesCourse = courseNames.some(cName => {
         const studentCourseName = cName.trim().toLowerCase();
         
-        // Exact match
-        if (studentCourseName === testCourseName) return true;
-        
-        // Loose shorthand matching (e.g. "ccc" in "ccc (course of computer concepts)")
-        // Match if student's course contains test's course (e.g. "CCC (Course...)" contains "CCC")
-        // OR test's course contains student's course (e.g. "CCC" contains "CCC")
-        if (studentCourseName.includes(testCourseName) || testCourseName.includes(studentCourseName)) return true;
+        // Match against test.course (legacy string)
+        if (testCourseName) {
+          if (studentCourseName === testCourseName) return true;
+          if (studentCourseName.includes(testCourseName) || testCourseName.includes(studentCourseName)) return true;
+          const cleanStudent = studentCourseName.replace(/[^a-z0-9]/g, '');
+          const cleanTest = testCourseName.replace(/[^a-z0-9]/g, '');
+          if (cleanStudent && cleanTest && (cleanStudent.includes(cleanTest) || cleanTest.includes(cleanStudent))) return true;
+        }
 
-        // Clean match (removing all spaces and special characters)
-        const cleanStudent = studentCourseName.replace(/[^a-z0-9]/g, '');
-        const cleanTest = testCourseName.replace(/[^a-z0-9]/g, '');
-        if (cleanStudent && cleanTest && (cleanStudent.includes(cleanTest) || cleanTest.includes(cleanStudent))) return true;
+        // Match against test.courses (array of strings)
+        if (Array.isArray(test.courses)) {
+          const hasMatch = test.courses.some(tc => {
+            const tcName = (tc || '').trim().toLowerCase();
+            if (!tcName) return false;
+            if (studentCourseName === tcName) return true;
+            if (studentCourseName.includes(tcName) || tcName.includes(studentCourseName)) return true;
+            const cleanStudent = studentCourseName.replace(/[^a-z0-9]/g, '');
+            const cleanTc = tcName.replace(/[^a-z0-9]/g, '');
+            if (cleanStudent && cleanTc && (cleanStudent.includes(cleanTc) || cleanTc.includes(cleanStudent))) return true;
+            return false;
+          });
+          if (hasMatch) return true;
+        }
 
         return false;
-      });
+      }) || (Array.isArray(test.courseIds) && test.courseIds.some(cId => courseIds.includes(cId)));
 
       if (!matchesCourse) return false;
 
@@ -838,6 +849,16 @@ router.get('/tests', verifyToken, async (req, res) => {
       }
 
       return testObj;
+    }).sort((a, b) => {
+      const getTestTime = (t) => {
+        if (t.createdAt) {
+          if (t.createdAt._seconds) return t.createdAt._seconds * 1000;
+          if (t.createdAt.seconds) return t.createdAt.seconds * 1000;
+          return new Date(t.createdAt).getTime();
+        }
+        return t.date ? new Date(t.date).getTime() : 0;
+      };
+      return getTestTime(b) - getTestTime(a); // newest first
     });
 
     res.status(200).json({ success: true, tests: enrichedTests });
@@ -1356,7 +1377,7 @@ router.get('/finance', verifyToken, async (req, res) => {
       totalCost = netFee;
     }
 
-    const paidAmount = Number(s.paidAmount) || 0;
+    const paidAmount = Number(s.paidAmount !== undefined && s.paidAmount !== null ? s.paidAmount : (s.feePaid || 0)) || 0;
     const totalDue = Math.max(0, totalCost - paidAmount);
 
     let dueMonths = [];

@@ -28,13 +28,28 @@ router.get('/tests', async (req, res) => {
           id: doc.id,
           title: data.title,
           course: data.course,
+          courses: data.courses || [],
+          courseIds: data.courseIds || [],
           duration: data.duration,
           totalMarks: data.totalMarks,
           questions: data.questions,
           difficulty: data.difficulty || 'Easy',
           description: data.description || '',
-          status: data.status // Adding status for debug
+          status: data.status,
+          date: data.date || '',
+          createdAt: data.createdAt || null
         };
+      })
+      .sort((a, b) => {
+        const getTestTime = (t) => {
+          if (t.createdAt) {
+            if (t.createdAt._seconds) return t.createdAt._seconds * 1000;
+            if (t.createdAt.seconds) return t.createdAt.seconds * 1000;
+            return new Date(t.createdAt).getTime();
+          }
+          return t.date ? new Date(t.date).getTime() : 0;
+        };
+        return getTestTime(b) - getTestTime(a); // newest first
       });
 
     console.log(`✅ [PublicTests] Returning ${tests.length} public tests to frontend`);
@@ -56,9 +71,6 @@ router.get('/tests/:testId', async (req, res) => {
     }
 
     const testData = testDoc.data();
-    if (!testData.isPublic || testData.status !== 'published') {
-      return res.status(403).json({ success: false, message: 'This test is not publicly available' });
-    }
 
     // Get questions WITHOUT correctAnswer field
     const qSnapshot = await db.collection('tests').doc(testId).collection('questions').get();
@@ -107,15 +119,12 @@ router.post('/tests/:testId/submit', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Participant name and contact are required' });
     }
 
-    // Validate test exists and is public
+    // Validate test exists
     const testDoc = await db.collection('tests').doc(testId).get();
     if (!testDoc.exists) {
       return res.status(404).json({ success: false, message: 'Test not found' });
     }
     const testData = testDoc.data();
-    if (!testData.isPublic) {
-      return res.status(403).json({ success: false, message: 'This test is not publicly available' });
-    }
 
     // Fetch questions with correct answers for grading
     const qSnapshot = await db.collection('tests').doc(testId).collection('questions').get();
@@ -424,9 +433,134 @@ router.get('/typing-paragraphs', async (req, res) => {
   }
 });
 
-// 10. Simple health check endpoint to check server availability
-router.get('/health-check', (req, res) => {
-  res.status(200).json({ success: true, message: 'Server is reachable' });
+// 11. Instant AI Translation Endpoint for Test Questions & Options
+router.post('/translate', async (req, res) => {
+  try {
+    const { question, options, targetLang } = req.body;
+    if (!question || !targetLang) {
+      return res.status(400).json({ success: false, message: 'Question and targetLang are required' });
+    }
+
+    const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+    if (!GEMINI_API_KEY) {
+      return res.status(500).json({ success: false, message: 'AI translation key not configured' });
+    }
+
+    const axios = require('axios');
+    const prompt = `Translate the following multiple-choice question and options into ${targetLang}.
+Keep technical computer terminology accurate, simple, and standard for Indian students.
+Question text: "${question}"
+Options: ${JSON.stringify(options || {})}
+
+You MUST output ONLY a valid JSON object without any backticks, markdown formatting, or preamble:
+{
+  "question": "translated question text here",
+  "options": {
+    "A": "translated option A",
+    "B": "translated option B",
+    "C": "translated option C",
+    "D": "translated option D"
+  }
+}`;
+
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: "application/json" }
+      },
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+
+    let generatedText = response.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    let translation = null;
+    try {
+      translation = JSON.parse(generatedText);
+    } catch (parseErr) {
+      const match = generatedText.match(/\{[\s\S]*\}/);
+      if (match) translation = JSON.parse(match[0]);
+    }
+
+    if (translation && translation.question) {
+      return res.status(200).json({ success: true, translation });
+    }
+    return res.status(500).json({ success: false, message: 'Failed to parse translation' });
+  } catch (error) {
+    console.error('Translation Route Error:', error);
+    res.status(500).json({ success: false, message: 'Error translating question' });
+  }
+});
+
+// 12. Batch AI Translation Endpoint for Background Pre-Caching
+router.post('/translate-batch', async (req, res) => {
+  try {
+    const { questions, targetLang } = req.body;
+    if (!Array.isArray(questions) || questions.length === 0 || !targetLang) {
+      return res.status(400).json({ success: false, message: 'Questions array and targetLang are required' });
+    }
+
+    const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+    if (!GEMINI_API_KEY) {
+      return res.status(500).json({ success: false, message: 'AI translation key not configured' });
+    }
+
+    const axios = require('axios');
+
+    // Limit batch size to max 10 per request to avoid Gemini output token truncation
+    const batchList = questions.slice(0, 10).map((q, idx) => ({
+      index: idx,
+      id: q.id,
+      question: q.question,
+      options: q.options
+    }));
+
+    const prompt = `Translate the following list of ${batchList.length} multiple-choice questions and options into ${targetLang}.
+Keep technical computer terminology accurate, simple, and standard for Indian students.
+
+Questions List:
+${JSON.stringify(batchList)}
+
+You MUST output ONLY a valid JSON array of objects without any backticks, markdown formatting, or preamble.
+Example JSON output:
+[
+  {
+    "id": "question_id_or_index",
+    "question": "translated question text here",
+    "options": {
+      "A": "translated option A",
+      "B": "translated option B",
+      "C": "translated option C",
+      "D": "translated option D"
+    }
+  }
+]`;
+
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: "application/json" }
+      },
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+
+    let generatedText = response.data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    let translations = [];
+    try {
+      translations = JSON.parse(generatedText);
+    } catch (parseErr) {
+      const match = generatedText.match(/\[\s*\{[\s\S]*\}\s*\]/);
+      if (match) translations = JSON.parse(match[0]);
+    }
+
+    if (Array.isArray(translations)) {
+      return res.status(200).json({ success: true, translations });
+    }
+    return res.status(500).json({ success: false, message: 'Failed to parse batch translation' });
+  } catch (error) {
+    console.error('Batch Translation Route Error:', error);
+    res.status(500).json({ success: false, message: 'Error in batch translation' });
+  }
 });
 
 module.exports = router;

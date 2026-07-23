@@ -654,6 +654,7 @@ router.post('/students', verifyToken, requireRole('admin'), upload.single('profi
       admissionDate: admissionDate || null,
       totalFee: totalFee || null,
       feePaid: feePaid || null,
+      paidAmount: Number(feePaid) || 0,
       paymentMode: paymentMode || null,
       admissionTakenBy: admissionTakenBy || null,
       receiptNumber: receiptNumber,
@@ -667,6 +668,34 @@ router.post('/students', verifyToken, requireRole('admin'), upload.single('profi
     }
 
     await db.collection('users').doc(uid).set(userData, { merge: true });
+
+    // Create initial fee payment receipt if feePaid > 0
+    if (Number(feePaid) > 0) {
+      try {
+        const recNo = receiptNumber || (`REC-ADM-` + uid.substring(0, 5).toUpperCase());
+        const paymentData = {
+          studentId: uid,
+          studentName: name || 'Student',
+          studentRollNumber: rollNumber || 'N/A',
+          courseId: courseId || '',
+          courseName: 'Admission Fee',
+          amount: Number(feePaid),
+          discountApplied: 0,
+          paymentMethod: paymentMode || 'Cash',
+          paymentType: 'admission',
+          monthsPaid: [],
+          receiptNo: recNo,
+          notes: 'Initial admission fee payment',
+          paidAt: admin.firestore.FieldValue.serverTimestamp()
+        };
+        if (userData.instituteId) {
+          paymentData.instituteId = userData.instituteId;
+        }
+        await db.collection('fee_payments').add(paymentData);
+      } catch (payErr) {
+        console.error('Failed to create initial fee_payments receipt:', payErr);
+      }
+    }
 
     // 3. Create initial enrollment record if courseId is provided
     if (courseId) {
@@ -755,7 +784,12 @@ router.put('/students/:id', verifyToken, requireRole(['superadmin', 'admin']), u
     if (batchTiming !== undefined) updateData.batchTiming = batchTiming || null;
     if (admissionDate !== undefined) updateData.admissionDate = admissionDate || null;
     if (totalFee !== undefined) updateData.totalFee = totalFee || null;
-    if (feePaid !== undefined) updateData.feePaid = feePaid || null;
+    if (feePaid !== undefined) {
+      updateData.feePaid = feePaid || null;
+      if (studentDoc.data().paidAmount === undefined || studentDoc.data().paidAmount === null || Number(studentDoc.data().paidAmount) === 0) {
+        updateData.paidAmount = Number(feePaid) || 0;
+      }
+    }
     if (paymentMode !== undefined) updateData.paymentMode = paymentMode || null;
     if (payment !== undefined) updateData.payment = payment || null;
 
@@ -999,7 +1033,6 @@ router.post('/tests', verifyToken, requireRole('admin'), csvUpload.single('quest
 });
 
 // 7. Get All Tests
-// 7. Get All Tests
 router.get('/tests', verifyToken, requireRole('admin'), async (req, res) => {
   try {
     console.log('DEBUG: /tests route hit, user role:', req.user?.role, 'instituteId:', req.user?.instituteId);
@@ -1010,7 +1043,19 @@ router.get('/tests', verifyToken, requireRole('admin'), async (req, res) => {
     }
     const snapshot = await testsQuery.get();
     console.log('DEBUG: Got snapshot, size:', snapshot.size);
-    const tests = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+    const tests = await Promise.all(snapshot.docs.map(async doc => {
+      const data = doc.data();
+      const qSnapshot = await db.collection('tests').doc(doc.id).collection('questions').get();
+      const actualQuestionsCount = qSnapshot.size;
+
+      // Auto-sync stored questions count if it mismatches actual questions subcollection size
+      if (data.questions !== actualQuestionsCount) {
+        doc.ref.update({ questions: actualQuestionsCount }).catch(err => console.error('Error auto-syncing questions count:', err));
+      }
+
+      return { id: doc.id, ...data, questions: actualQuestionsCount };
+    }));
 
     // Sort in JS instead of Firestore to avoid needing a composite index
     tests.sort((a, b) => {
@@ -1244,8 +1289,6 @@ router.post('/tests/:testId/questions', verifyToken, requireRole('admin'), async
     }
 
     // Generate numeric id like q41
-    const currentQuestionsCount = testDoc.data().questions || 0;
-    const newCount = currentQuestionsCount + 1;
     const newQId = `q${Date.now()}`; // Unique enough or use q<number> but careful of deletions
 
     const questionData = {
@@ -1257,7 +1300,9 @@ router.post('/tests/:testId/questions', verifyToken, requireRole('admin'), async
 
     await db.collection('tests').doc(testId).collection('questions').doc(newQId).set(questionData);
     
-    // Increment count on test doc
+    // Sync exact subcollection count on test doc
+    const qSnap = await db.collection('tests').doc(testId).collection('questions').get();
+    const newCount = qSnap.size;
     await testRef.update({ questions: newCount });
 
     res.status(201).json({ success: true, message: 'Question added successfully', question: { id: newQId, ...questionData } });
@@ -1318,9 +1363,9 @@ router.delete('/tests/:testId/questions/:questionId', verifyToken, requireRole('
 
     await qRef.delete();
     
-    // Decrement count
-    const currentCount = testDoc.data().questions || 0;
-    const newCount = Math.max(0, currentCount - 1);
+    // Sync exact subcollection count on test doc
+    const qSnap = await testRef.collection('questions').get();
+    const newCount = qSnap.size;
     await testRef.update({ questions: newCount });
 
     res.status(200).json({ success: true, message: 'Question deleted successfully', newOptionsCount: newCount });
@@ -1559,7 +1604,7 @@ router.get('/finance/summary', verifyToken, requireRole('admin'), async (req, re
       const netFee = Math.max(0, baseFee - discountAmount);
       
       let totalStudentFee = 0;
-      let studentPaidAmount = Number(student.paidAmount) || 0;
+      let studentPaidAmount = Number(student.paidAmount !== undefined && student.paidAmount !== null ? student.paidAmount : (student.feePaid || 0)) || 0;
       
       if (feeType === 'monthly') {
         const monthsList = getEnrolledMonthsList(student.createdAt, course.duration, 'monthly');
@@ -1708,7 +1753,7 @@ router.get('/finance/students', verifyToken, requireRole('admin'), async (req, r
         totalCost = netFee;
       }
       
-      const paidAmount = Number(s.paidAmount) || 0;
+      const paidAmount = Number(s.paidAmount !== undefined && s.paidAmount !== null ? s.paidAmount : (s.feePaid || 0)) || 0;
       const totalDue = Math.max(0, totalCost - paidAmount);
       
       // Determine due months for monthly students
@@ -2046,9 +2091,9 @@ router.post('/chat-ai', verifyToken, requireRole(['admin', 'superadmin']), async
 // POST /api/admin/generate-questions
 router.post('/generate-questions', verifyToken, requireRole(['admin', 'superadmin']), async (req, res) => {
   try {
-    const { topic, count } = req.body;
-    if (!topic) {
-      return res.status(400).json({ success: false, message: 'Topic is required' });
+    const { topic, count, lessons, courseName } = req.body;
+    if (!topic && (!Array.isArray(lessons) || lessons.length === 0)) {
+      return res.status(400).json({ success: false, message: 'Topic or lessons are required' });
     }
     const targetCount = parseInt(count) || 5;
     const finalCount = Math.min(100, Math.max(1, targetCount));
