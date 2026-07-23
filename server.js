@@ -62,14 +62,6 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
-
-  // Keep-alive self ping every 5 minutes to prevent Render free-tier container sleep
-  setInterval(() => {
-    try {
-      const http = require('http');
-      http.get(`http://localhost:${PORT}/api/test-direct`, () => {}).on('error', () => {});
-    } catch (e) {}
-  }, 5 * 60 * 1000);
 });
 
 // ─── AUTO-LAUNCH CRON ──────────────────────────────────────────────────────────
@@ -126,4 +118,24 @@ const autoLaunchTests = async () => {
 // Run immediately on startup, then every 60 seconds
 autoLaunchTests();
 setInterval(autoLaunchTests, 60 * 1000);
-// Trigger nodemon reload to refresh routes
+
+// ─── SELF KEEP-ALIVE (PREVENT RENDER SLEEP MODE) ────────────────────────────────
+const https = require('https');
+const http = require('http');
+
+const keepAlivePing = () => {
+  const targetUrl = process.env.VITE_API_URL 
+    ? `${process.env.VITE_API_URL}/public/ping` 
+    : 'https://ng-backend-91oz.onrender.com/api/public/ping';
+    
+  const client = targetUrl.startsWith('https') ? https : http;
+  client.get(targetUrl, (res) => {
+    console.log(`⏰ [Self-KeepAlive] Server ping status: ${res.statusCode}`);
+  }).on('error', (err) => {
+    console.log(`⏰ [Self-KeepAlive] Server ping error: ${err.message}`);
+  });
+};
+
+// Ping every 10 minutes (600,000 ms) so Render free instance never spins down
+setInterval(keepAlivePing, 10 * 60 * 1000);
+

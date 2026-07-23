@@ -4,36 +4,42 @@ const router = express.Router();
 
 console.log('🚀 [PublicRoutes] Module loaded and initialized');
 
-// ─── PUBLIC TEST ROUTES ────────────────────────────────────────────────────────
-// These routes are accessible WITHOUT authentication.
-// Data is stored separately from internal student records.
+// 0. Lightweight Health/Ping Endpoint for Keep-Alive
+router.get('/ping', (req, res) => {
+  res.status(200).json({ success: true, status: 'online', timestamp: new Date().toISOString() });
+});
 
-// Simple high-performance in-memory cache for public endpoints (TTL: 60 seconds)
-const memoryCache = {};
-const getCached = (key, ttl = 60000) => {
-  const item = memoryCache[key];
-  if (item && (Date.now() - item.timestamp < ttl)) {
-    return item.data;
-  }
-  return null;
-};
-const setCached = (key, data) => {
-  memoryCache[key] = { data, timestamp: Date.now() };
-};
+// In-Memory Server Cache for Home Bundle (TTL: 3 minutes)
+let homeDataCache = null;
+let homeDataCacheTime = 0;
+const HOME_CACHE_TTL_MS = 3 * 60 * 1000;
 
-// 1. Get all published tests that are marked as "public"
-router.get('/tests', async (req, res) => {
+// Helper to invalidate cache when public data changes
+const invalidateHomeCache = () => {
+  homeDataCache = null;
+  homeDataCacheTime = 0;
+};
+router.invalidateHomeCache = invalidateHomeCache;
+
+// Combined High-Performance Public Home Data Bundle
+router.get('/home-data', async (req, res) => {
   try {
-    const cached = getCached('public_tests', 60000);
-    if (cached) {
-      return res.status(200).json({ success: true, tests: cached });
+    const now = Date.now();
+    if (homeDataCache && (now - homeDataCacheTime < HOME_CACHE_TTL_MS)) {
+      return res.status(200).json({ success: true, ...homeDataCache, cached: true });
     }
 
-    const snapshot = await db.collection('tests')
-      .where('isPublic', '==', true)
-      .get();
+    const [testsSnap, resultsSnap, settingsDoc, studentsSnap, coursesSnap, govServicesSnap] = await Promise.all([
+      db.collection('tests').where('isPublic', '==', true).get(),
+      db.collection('public_test_results').get(),
+      db.collection('settings').doc('web_controls').get(),
+      db.collection('users').where('role', '==', 'student').get(),
+      db.collection('courses').where('status', '==', 'active').get(),
+      db.collection('gov_services').orderBy('createdAt', 'desc').get()
+    ]);
 
-    const tests = snapshot.docs
+    // 1. Process Tests
+    const tests = testsSnap.docs
       .map(doc => {
         const data = doc.data();
         return {
@@ -64,7 +70,147 @@ router.get('/tests', async (req, res) => {
         return getTestTime(b) - getTestTime(a);
       });
 
-    setCached('public_tests', tests);
+    // 2. Process Leaderboard
+    const participantMap = {};
+    resultsSnap.docs.forEach(doc => {
+      const data = doc.data();
+      const key = `${data.participantName}_${data.participantContact}`;
+      if (!participantMap[key]) {
+        participantMap[key] = {
+          name: data.participantName,
+          testsAttempted: 0,
+          totalScore: 0,
+          totalMarks: 0,
+        };
+      }
+      participantMap[key].testsAttempted += 1;
+      participantMap[key].totalScore += data.score;
+      participantMap[key].totalMarks += data.totalMarks;
+    });
+
+    const leaderboard = Object.values(participantMap).map(p => ({
+      ...p,
+      avgPercentage: p.totalMarks > 0 ? Math.round((p.totalScore / p.totalMarks) * 10000) / 100 : 0,
+    }));
+    leaderboard.sort((a, b) => b.avgPercentage - a.avgPercentage);
+    leaderboard.forEach((r, idx) => { r.rank = idx + 1; });
+    const topLeaderboard = leaderboard.slice(0, 50);
+
+    // 3. Process Stats
+    let showStats = true;
+    let dataSource = 'real';
+    let dummyData = { studentsCount: 14, coursesCount: 1, successRate: 95, certificatesCount: 24 };
+
+    if (settingsDoc.exists) {
+      const data = settingsDoc.data();
+      if (data.homepageStats) {
+        showStats = data.homepageStats.showStats !== false;
+        dataSource = data.homepageStats.dataSource || 'real';
+        if (data.homepageStats.dummyData) {
+          dummyData = { ...dummyData, ...data.homepageStats.dummyData };
+        }
+      }
+    }
+
+    let stats = {};
+    if (dataSource === 'real') {
+      stats = {
+        studentsCount: studentsSnap.size,
+        coursesCount: coursesSnap.size,
+        successRate: 95,
+        certificatesCount: resultsSnap.size,
+      };
+    } else {
+      stats = {
+        studentsCount: Number(dummyData.studentsCount) || 0,
+        coursesCount: Number(dummyData.coursesCount) || 0,
+        successRate: Number(dummyData.successRate) || 0,
+        certificatesCount: Number(dummyData.certificatesCount) || 0,
+      };
+    }
+
+    // 4. Process Courses
+    const courses = coursesSnap.docs.map(doc => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        name: data.name,
+        duration: data.duration,
+        fees: data.fees,
+        thumbnailUrl: data.thumbnailUrl || null,
+        students: data.students || 0,
+        status: data.status,
+        instituteId: data.instituteId || null
+      };
+    });
+
+    // 5. Process Services
+    const services = govServicesSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+    const payload = {
+      tests,
+      leaderboard: topLeaderboard,
+      showStats,
+      stats,
+      courses,
+      services
+    };
+
+    homeDataCache = payload;
+    homeDataCacheTime = now;
+
+    res.status(200).json({ success: true, ...payload, cached: false });
+  } catch (error) {
+    console.error('Home Data Bundle Fetch Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching home data bundle' });
+  }
+});
+
+// 1. Get all published tests that are marked as "public"
+router.get('/tests', async (req, res) => {
+  try {
+    // Fetch all public tests and then filter by status in JS to handle case-sensitivity issues
+    const snapshot = await db.collection('tests')
+      .where('isPublic', '==', true)
+      .get();
+
+    console.log(`🔍 [PublicTests] Total public tests in DB: ${snapshot.size}`);
+
+    console.log(`🔍 [PublicTests] Total public tests in DB: ${snapshot.size}`);
+
+    const tests = snapshot.docs
+      .map(doc => {
+        const data = doc.data();
+        console.log(`   - Test found: "${data.title}", Status: "${data.status}", isPublic: ${data.isPublic}`);
+        return {
+          id: doc.id,
+          title: data.title,
+          course: data.course,
+          courses: data.courses || [],
+          courseIds: data.courseIds || [],
+          duration: data.duration,
+          totalMarks: data.totalMarks,
+          questions: data.questions,
+          difficulty: data.difficulty || 'Easy',
+          description: data.description || '',
+          status: data.status,
+          date: data.date || '',
+          createdAt: data.createdAt || null
+        };
+      })
+      .sort((a, b) => {
+        const getTestTime = (t) => {
+          if (t.createdAt) {
+            if (t.createdAt._seconds) return t.createdAt._seconds * 1000;
+            if (t.createdAt.seconds) return t.createdAt.seconds * 1000;
+            return new Date(t.createdAt).getTime();
+          }
+          return t.date ? new Date(t.date).getTime() : 0;
+        };
+        return getTestTime(b) - getTestTime(a); // newest first
+      });
+
+    console.log(`✅ [PublicTests] Returning ${tests.length} public tests to frontend`);
     res.status(200).json({ success: true, tests });
   } catch (error) {
     console.error('Public Tests Fetch Error:', error);
@@ -381,11 +527,6 @@ router.get('/stats', async (req, res) => {
 // 7. Get public active courses for landing page
 router.get('/courses', async (req, res) => {
   try {
-    const cached = getCached('public_courses', 60000);
-    if (cached) {
-      return res.status(200).json({ success: true, courses: cached });
-    }
-
     const snapshot = await db.collection('courses')
       .where('status', '==', 'active')
       .get();
@@ -404,7 +545,6 @@ router.get('/courses', async (req, res) => {
       };
     });
 
-    setCached('public_courses', courses);
     res.status(200).json({ success: true, courses });
   } catch (error) {
     console.error('Public Courses Fetch Error:', error);
@@ -415,15 +555,8 @@ router.get('/courses', async (req, res) => {
 // 8. Get all public government services
 router.get('/gov-services', async (req, res) => {
   try {
-    const cached = getCached('gov_services', 60000);
-    if (cached) {
-      return res.status(200).json({ success: true, services: cached });
-    }
-
     const snapshot = await db.collection('gov_services').orderBy('createdAt', 'desc').get();
     const services = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-
-    setCached('gov_services', services);
     res.status(200).json({ success: true, services });
   } catch (error) {
     console.error('Public Fetch Gov Services Error:', error);
