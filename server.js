@@ -62,6 +62,14 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
+
+  // Keep-alive self ping every 5 minutes to prevent Render free-tier container sleep
+  setInterval(() => {
+    try {
+      const http = require('http');
+      http.get(`http://localhost:${PORT}/api/test-direct`, () => {}).on('error', () => {});
+    } catch (e) {}
+  }, 5 * 60 * 1000);
 });
 
 // ─── AUTO-LAUNCH CRON ──────────────────────────────────────────────────────────

@@ -8,22 +8,34 @@ console.log('🚀 [PublicRoutes] Module loaded and initialized');
 // These routes are accessible WITHOUT authentication.
 // Data is stored separately from internal student records.
 
+// Simple high-performance in-memory cache for public endpoints (TTL: 60 seconds)
+const memoryCache = {};
+const getCached = (key, ttl = 60000) => {
+  const item = memoryCache[key];
+  if (item && (Date.now() - item.timestamp < ttl)) {
+    return item.data;
+  }
+  return null;
+};
+const setCached = (key, data) => {
+  memoryCache[key] = { data, timestamp: Date.now() };
+};
+
 // 1. Get all published tests that are marked as "public"
 router.get('/tests', async (req, res) => {
   try {
-    // Fetch all public tests and then filter by status in JS to handle case-sensitivity issues
+    const cached = getCached('public_tests', 60000);
+    if (cached) {
+      return res.status(200).json({ success: true, tests: cached });
+    }
+
     const snapshot = await db.collection('tests')
       .where('isPublic', '==', true)
       .get();
 
-    console.log(`🔍 [PublicTests] Total public tests in DB: ${snapshot.size}`);
-
-    console.log(`🔍 [PublicTests] Total public tests in DB: ${snapshot.size}`);
-
     const tests = snapshot.docs
       .map(doc => {
         const data = doc.data();
-        console.log(`   - Test found: "${data.title}", Status: "${data.status}", isPublic: ${data.isPublic}`);
         return {
           id: doc.id,
           title: data.title,
@@ -49,10 +61,10 @@ router.get('/tests', async (req, res) => {
           }
           return t.date ? new Date(t.date).getTime() : 0;
         };
-        return getTestTime(b) - getTestTime(a); // newest first
+        return getTestTime(b) - getTestTime(a);
       });
 
-    console.log(`✅ [PublicTests] Returning ${tests.length} public tests to frontend`);
+    setCached('public_tests', tests);
     res.status(200).json({ success: true, tests });
   } catch (error) {
     console.error('Public Tests Fetch Error:', error);
@@ -369,6 +381,11 @@ router.get('/stats', async (req, res) => {
 // 7. Get public active courses for landing page
 router.get('/courses', async (req, res) => {
   try {
+    const cached = getCached('public_courses', 60000);
+    if (cached) {
+      return res.status(200).json({ success: true, courses: cached });
+    }
+
     const snapshot = await db.collection('courses')
       .where('status', '==', 'active')
       .get();
@@ -387,6 +404,7 @@ router.get('/courses', async (req, res) => {
       };
     });
 
+    setCached('public_courses', courses);
     res.status(200).json({ success: true, courses });
   } catch (error) {
     console.error('Public Courses Fetch Error:', error);
@@ -397,8 +415,15 @@ router.get('/courses', async (req, res) => {
 // 8. Get all public government services
 router.get('/gov-services', async (req, res) => {
   try {
+    const cached = getCached('gov_services', 60000);
+    if (cached) {
+      return res.status(200).json({ success: true, services: cached });
+    }
+
     const snapshot = await db.collection('gov_services').orderBy('createdAt', 'desc').get();
     const services = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+    setCached('gov_services', services);
     res.status(200).json({ success: true, services });
   } catch (error) {
     console.error('Public Fetch Gov Services Error:', error);
