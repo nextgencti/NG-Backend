@@ -273,8 +273,17 @@ router.post('/tests/:testId/submit', async (req, res) => {
     const { answers, participant } = req.body;
 
     // Validate participant info
-    if (!participant || !participant.name || !participant.contact) {
-      return res.status(400).json({ success: false, message: 'Participant name and contact are required' });
+    if (!participant || !participant.name?.trim() || !participant.contact?.toString().trim()) {
+      return res.status(400).json({ success: false, message: 'Participant name and mobile number are required' });
+    }
+
+    const contactStr = participant.contact.toString().trim();
+    const cleanDigits = contactStr.replace(/\D/g, '');
+    const mobileRegex = /^[6-9]\d{9}$/;
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    if (!mobileRegex.test(cleanDigits) && !emailRegex.test(contactStr)) {
+      return res.status(400).json({ success: false, message: 'Please provide a valid 10-digit mobile number' });
     }
 
     // Validate test exists

@@ -220,6 +220,9 @@ router.post('/google-login', async (req, res) => {
 
   } catch (error) {
     console.error('Google Login Verification Error:', error);
+    if (error.code === 8 || (error.message && error.message.includes('Quota exceeded'))) {
+      return res.status(503).json({ success: false, message: 'Database Quota Exceeded. Please try again tomorrow.' });
+    }
     res.status(401).json({ success: false, message: 'Unauthorized / Invalid Google Token' });
   }
 });
@@ -295,6 +298,9 @@ router.post('/firebase-login', async (req, res) => {
 
   } catch (error) {
     console.error('Firebase Login Verification Error:', error);
+    if (error.code === 8 || (error.message && error.message.includes('Quota exceeded'))) {
+      return res.status(503).json({ success: false, message: 'Database Quota Exceeded. Please try again tomorrow.' });
+    }
     res.status(401).json({ success: false, message: 'Unauthorized / Invalid Firebase Token' });
   }
 });
