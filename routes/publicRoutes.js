@@ -147,13 +147,23 @@ router.get('/home-data', async (req, res) => {
     // 5. Process Services
     const services = govServicesSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 
+    // 6. Process Welcome Popup Setting
+    let welcomePopup = null;
+    if (settingsDoc.exists) {
+      const settingsData = settingsDoc.data();
+      if (settingsData && settingsData.welcomePopup) {
+        welcomePopup = settingsData.welcomePopup;
+      }
+    }
+
     const payload = {
       tests,
       leaderboard: topLeaderboard,
       showStats,
       stats,
       courses,
-      services
+      services,
+      welcomePopup
     };
 
     homeDataCache = payload;
@@ -163,6 +173,20 @@ router.get('/home-data', async (req, res) => {
   } catch (error) {
     console.error('Home Data Bundle Fetch Error:', error);
     res.status(500).json({ success: false, message: 'Server error fetching home data bundle' });
+  }
+});
+
+// Standalone endpoint for welcome popup
+router.get('/welcome-popup', async (req, res) => {
+  try {
+    const doc = await db.collection('settings').doc('web_controls').get();
+    if (!doc.exists || !doc.data()?.welcomePopup) {
+      return res.status(200).json({ success: true, welcomePopup: null });
+    }
+    res.status(200).json({ success: true, welcomePopup: doc.data().welcomePopup });
+  } catch (error) {
+    console.error('Fetch Welcome Popup Error:', error);
+    res.status(500).json({ success: false, message: 'Server error fetching welcome popup' });
   }
 });
 

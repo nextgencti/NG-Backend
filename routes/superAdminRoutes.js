@@ -596,6 +596,13 @@ router.get('/web-controls', verifyToken, requireRole('superadmin'), async (req, 
           successRate: 95,
           certificatesCount: 24
         }
+      },
+      welcomePopup: {
+        enabled: false,
+        imageUrl: '',
+        title: '',
+        link: '',
+        showOncePerSession: true
       }
     };
 
@@ -609,6 +616,10 @@ router.get('/web-controls', verifyToken, requireRole('superadmin'), async (req, 
       homepageStats: {
         ...defaultSettings.homepageStats,
         ...(docData.homepageStats || {})
+      },
+      welcomePopup: {
+        ...defaultSettings.welcomePopup,
+        ...(docData.welcomePopup || {})
       }
     };
 
@@ -622,14 +633,25 @@ router.get('/web-controls', verifyToken, requireRole('superadmin'), async (req, 
 // 14. Update Web Controls Settings
 router.post('/web-controls', verifyToken, requireRole('superadmin'), async (req, res) => {
   try {
-    const { homepageStats } = req.body;
+    const { homepageStats, welcomePopup } = req.body;
     
-    if (!homepageStats) {
+    if (!homepageStats && !welcomePopup) {
       return res.status(400).json({ success: false, message: 'Invalid settings data' });
     }
 
+    const updateData = {};
+    if (homepageStats) updateData.homepageStats = homepageStats;
+    if (welcomePopup) updateData.welcomePopup = welcomePopup;
+
     const docRef = db.collection('settings').doc('web_controls');
-    await docRef.set({ homepageStats }, { merge: true });
+    await docRef.set(updateData, { merge: true });
+
+    try {
+      const publicRoutes = require('./publicRoutes');
+      if (publicRoutes && typeof publicRoutes.invalidateHomeCache === 'function') {
+        publicRoutes.invalidateHomeCache();
+      }
+    } catch (e) {}
 
     res.status(200).json({ success: true, message: 'Settings updated successfully' });
   } catch (error) {
@@ -655,6 +677,80 @@ const uploadToCloudinary = (fileBuffer, folder, mimetype = '') => {
     uploadStream.end(fileBuffer);
   });
 };
+
+// 14b. Upload and Save Welcome Popup Image & Settings
+router.post('/welcome-popup', verifyToken, requireRole('superadmin'), upload.single('image'), async (req, res) => {
+  try {
+    const { enabled, title, link, showOncePerSession, imageUrl: existingImageUrl } = req.body;
+    let finalImageUrl = existingImageUrl || '';
+
+    if (req.file) {
+      const result = await uploadToCloudinary(req.file.buffer, 'welcome_popups', req.file.mimetype);
+      finalImageUrl = result.secure_url;
+    }
+
+    const welcomePopupData = {
+      enabled: enabled === 'true' || enabled === true,
+      imageUrl: finalImageUrl,
+      title: title || '',
+      link: link || '',
+      showOncePerSession: showOncePerSession === 'true' || showOncePerSession === true,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    const docRef = db.collection('settings').doc('web_controls');
+    await docRef.set({ welcomePopup: welcomePopupData }, { merge: true });
+
+    try {
+      const publicRoutes = require('./publicRoutes');
+      if (publicRoutes && typeof publicRoutes.invalidateHomeCache === 'function') {
+        publicRoutes.invalidateHomeCache();
+      }
+    } catch (e) {}
+
+    res.status(200).json({
+      success: true,
+      message: 'Welcome popup updated successfully',
+      welcomePopup: welcomePopupData
+    });
+  } catch (error) {
+    console.error('Update Welcome Popup Error:', error);
+    res.status(500).json({ success: false, message: 'Server error updating welcome popup' });
+  }
+});
+
+// 14c. Delete / Reset Welcome Popup
+router.delete('/welcome-popup', verifyToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const welcomePopupData = {
+      enabled: false,
+      imageUrl: '',
+      title: '',
+      link: '',
+      showOncePerSession: true,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    const docRef = db.collection('settings').doc('web_controls');
+    await docRef.set({ welcomePopup: welcomePopupData }, { merge: true });
+
+    try {
+      const publicRoutes = require('./publicRoutes');
+      if (publicRoutes && typeof publicRoutes.invalidateHomeCache === 'function') {
+        publicRoutes.invalidateHomeCache();
+      }
+    } catch (e) {}
+
+    res.status(200).json({
+      success: true,
+      message: 'Welcome popup removed successfully',
+      welcomePopup: welcomePopupData
+    });
+  } catch (error) {
+    console.error('Delete Welcome Popup Error:', error);
+    res.status(500).json({ success: false, message: 'Server error removing welcome popup' });
+  }
+});
 
 // 15. Get All Government Services
 router.get('/gov-services', verifyToken, requireRole('superadmin'), async (req, res) => {
